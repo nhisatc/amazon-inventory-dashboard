@@ -139,6 +139,36 @@ def fetch_inventory() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _consolidate_by_asin(df: pd.DataFrame) -> pd.DataFrame:
+    """Merge rows that share the same ASIN (multiple SKUs → one row per product).
+    Sums available/inbound/reserved. Picks the SKU with most available stock,
+    preferring non-auto-generated 'Amazon.Found.*' SKUs."""
+    if df.empty:
+        return df
+    result = []
+    for asin, group in df.groupby("asin"):
+        clean = group[~group["sku"].str.startswith("Amazon.Found.")]
+        primary = clean if not clean.empty else group
+        best = primary.loc[primary["available"].idxmax()]
+        result.append({
+            "sku":       best["sku"],
+            "asin":      asin,
+            "item_name": best["item_name"],
+            "available": int(group["available"].sum()),
+            "inbound":   int(group["inbound"].sum()),
+            "reserved":  int(group["reserved"].sum()),
+        })
+    consolidated = pd.DataFrame(result)
+    dupes = df.groupby("asin").size()
+    dupes = dupes[dupes > 1]
+    if not dupes.empty:
+        print(f"  Merged {len(dupes)} ASINs with multiple SKUs:")
+        for asin in dupes.index:
+            skus = df[df["asin"] == asin]["sku"].tolist()
+            print(f"    {asin}: {' + '.join(skus)}")
+    return consolidated
+
+
 def _target_months() -> list[str]:
     last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
     months = []
@@ -1143,6 +1173,8 @@ def run():
     print("\n[1/5] Fetching FBA inventory from SP-API...")
     inventory = fetch_inventory()
     print(f"      {len(inventory)} SKUs found")
+    inventory = _consolidate_by_asin(inventory)
+    print(f"      {len(inventory)} unique ASINs after consolidation")
 
     asins = inventory["asin"].dropna().unique().tolist()
 
