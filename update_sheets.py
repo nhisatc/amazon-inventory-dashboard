@@ -1384,10 +1384,12 @@ def _notify_slack(df: pd.DataFrame, sheet_id: str):
         })
 
     blocks.append({
-        "type": "context",
+        "type": "actions",
         "elements": [{
-            "type": "mrkdwn",
-            "text": f"📊 <{sheet_url}|Open Inventory Sheet>",
+            "type": "button",
+            "text": {"type": "plain_text", "text": "📊 Open Inventory Sheet"},
+            "url": sheet_url,
+            "style": "primary",
         }]
     })
 
