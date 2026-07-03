@@ -774,6 +774,11 @@ def _add_dashboard_charts(ss: gspread.Spreadsheet, sid: int, n_reorder_skus: int
     #   Row 8  (M9:N9) : "Product" | "Order Qty" ← header (skipped)
     #   Rows 9-9+n     : reorder data          ← bar chart source
 
+    # Both charts anchor at the same cell (row 2, col 14 = right of KPI cards).
+    # Pie on the left, bar offset 410px to the right — side by side, no overlap.
+    CHART_HEIGHT = 480
+    anchor = {"anchorCell": {**ref, "rowIndex": 2, "columnIndex": 14}}
+
     # Pie chart — status distribution
     donut = {
         "addChart": {"chart": {
@@ -797,13 +802,14 @@ def _add_dashboard_charts(ss: gspread.Spreadsheet, sid: int, n_reorder_skus: int
                 },
             },
             "position": {"overlayPosition": {
-                "anchorCell": {**ref, "rowIndex": 2, "columnIndex": 14},
-                "widthPixels": 400, "heightPixels": 255,
+                **anchor,
+                "offsetXPixels": 0, "offsetYPixels": 0,
+                "widthPixels": 400, "heightPixels": CHART_HEIGHT,
             }},
         }}
     }
 
-    # Bar chart — units to reorder by product
+    # Bar chart — units to reorder by product (placed right of pie, no overlap)
     n = max(n_reorder_skus, 1)
     bar = {
         "addChart": {"chart": {
@@ -831,8 +837,9 @@ def _add_dashboard_charts(ss: gspread.Spreadsheet, sid: int, n_reorder_skus: int
                 },
             },
             "position": {"overlayPosition": {
-                "anchorCell": {**ref, "rowIndex": 8, "columnIndex": 14},
-                "widthPixels": 400, "heightPixels": 295,
+                **anchor,
+                "offsetXPixels": 410, "offsetYPixels": 0,
+                "widthPixels": 440, "heightPixels": CHART_HEIGHT,
             }},
         }}
     }
