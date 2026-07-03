@@ -856,16 +856,21 @@ def _add_dashboard_charts(ss: gspread.Spreadsheet, sid: int, n_reorder_skus: int
 
 def _read_hedda_shipments(gc: gspread.Client) -> dict:
     """
-    Read Hedda's FBA shipment tracking sheet and return a dict keyed by ASIN:
-      { asin: {"shipment_id": str, "status": str, "eta": str, "units": int} }
+    Read Hedda's FBA Shipment Tracker and return a dict keyed by ASIN.
+    Multiple shipments per ASIN are aggregated.
 
-    Active statuses that mean stock is already on its way:
-      Working / Shipped / In Transit / Receiving
-    Closed / Cancelled / Deleted are ignored (no longer relevant).
+    Sheet columns (0-based, from 'Shipment Tracker' tab):
+      0  Shipment ID (FBA)
+      2  ASIN
+      6  Destination FC
+      7  Pickup Date
+      10 Status
+      12 Units Expected
 
-    Returns {} if the sheet is not shared or cannot be read.
+    Active statuses: In transit | Receiving | Pending Pickup
+    Returns {} if sheet is not accessible.
     """
-    ACTIVE = {"working", "shipped", "in transit", "receiving"}
+    ACTIVE = {"in transit", "receiving", "pending pickup"}
 
     try:
         ss_h = gc.open_by_key(HEDDA_SHEET_ID)
@@ -873,62 +878,57 @@ def _read_hedda_shipments(gc: gspread.Client) -> dict:
         print("  Hedda's sheet: not accessible — share with the service account to enable cross-reference")
         return {}
 
-    shipments: dict = {}
     try:
-        ws = ss_h.worksheets()[0]
+        ws   = ss_h.worksheet("Shipment Tracker")
         rows = ws.get_all_values()
-        if not rows:
+        if len(rows) < 2:
             return {}
 
-        headers = [h.strip().lower() for h in rows[0]]
-
-        # Try to find columns by flexible name matching
-        def _col(names):
-            for name in names:
-                for i, h in enumerate(headers):
-                    if name in h:
-                        return i
-            return None
-
-        col_asin     = _col(["asin"])
-        col_shipment = _col(["shipment id", "shipment_id", "fba id"])
-        col_status   = _col(["status"])
-        col_eta      = _col(["eta", "arrival", "estimated", "delivery"])
-        col_units    = _col(["units", "qty", "quantity"])
-
-        if col_asin is None:
-            print(f"  Hedda's sheet: no ASIN column found. Headers: {rows[0]}")
-            return {}
-
-        print(f"  Hedda's sheet: {len(rows)-1} shipment rows found")
+        # {asin: {shipment_ids, statuses, total_units, pickup_dates, dest_fcs}}
+        by_asin: dict = {}
 
         for row in rows[1:]:
-            if not row or len(row) <= col_asin:
+            if len(row) < 13:
                 continue
-            asin = row[col_asin].strip()
-            if not asin:
+            asin   = row[2].strip()
+            status = row[10].strip()
+            if not asin or status.lower() not in ACTIVE:
                 continue
 
-            status = row[col_status].strip() if col_status is not None and len(row) > col_status else ""
-            if status.lower() not in ACTIVE:
-                continue  # skip closed/cancelled/irrelevant rows
-
-            shipment_id = row[col_shipment].strip() if col_shipment is not None and len(row) > col_shipment else ""
-            eta         = row[col_eta].strip()      if col_eta      is not None and len(row) > col_eta      else ""
+            shipment_id = row[0].strip()
+            dest_fc     = row[6].strip()
+            pickup_date = row[7].strip()
             try:
-                units = int(row[col_units].replace(",", "")) if col_units is not None and len(row) > col_units and row[col_units].strip() else 0
+                units = int(row[12].replace(",", "")) if row[12].strip() else 0
             except ValueError:
                 units = 0
 
-            # Keep the most recent active shipment per ASIN (last row wins)
+            if asin not in by_asin:
+                by_asin[asin] = {"ids": [], "statuses": set(), "units": 0,
+                                 "dates": [], "fcs": []}
+            by_asin[asin]["ids"].append(shipment_id)
+            by_asin[asin]["statuses"].add(status)
+            by_asin[asin]["units"] += units
+            if pickup_date:
+                by_asin[asin]["dates"].append(pickup_date)
+            if dest_fc:
+                by_asin[asin]["fcs"].append(dest_fc)
+
+        # Flatten into display-ready strings
+        shipments = {}
+        for asin, d in by_asin.items():
+            status_str = " + ".join(sorted(d["statuses"]))
+            ids_str    = ", ".join(d["ids"])
+            fcs_str    = ", ".join(sorted(set(d["fcs"])))
             shipments[asin] = {
-                "shipment_id": shipment_id,
-                "status":      status,
-                "eta":         eta,
-                "units":       units,
+                "status":   status_str,
+                "ids":      ids_str,
+                "units":    d["units"],
+                "fcs":      fcs_str,
+                "n":        len(d["ids"]),
             }
 
-        print(f"  Hedda's sheet: {len(shipments)} ASINs with active shipments")
+        print(f"  Hedda's sheet: {len(rows)-1} rows → {len(shipments)} ASINs with active shipments")
         return shipments
 
     except Exception as e:
@@ -954,14 +954,15 @@ def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, shipments:
         s = shipments.get(asin)
         if not s:
             return ""
-        parts = [s["status"]]
-        if s["shipment_id"]:
-            parts.append(s["shipment_id"])
-        if s["eta"]:
-            parts.append(f"ETA {s['eta']}")
+        label = f"{s['n']} shipment{'s' if s['n'] != 1 else ''}"
+        parts = [f"{label} ({s['status']})"]
         if s["units"]:
-            parts.append(f"{s['units']} units")
-        return " · ".join(parts)
+            parts.append(f"{s['units']:,} units inbound")
+        if s["fcs"]:
+            parts.append(f"→ {s['fcs']}")
+        if s["ids"]:
+            parts.append(s["ids"])
+        return "\n".join(parts)
 
     rows = [[
         r["sku"], r["asin"], _product_label(r["asin"], r.get("item_name", "")),
