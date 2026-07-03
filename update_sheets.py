@@ -41,6 +41,7 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 LEAD_DAYS     = 60
 Z_SCORE       = 1.65   # 95% service level
 TARGET_MONTHS = 2
+HEDDA_SHEET_ID = "1uZjMJHPv-qkV2Mek-6dMJWjv1PITFOMSopbKdyEIVgY"
 SHEET_NAME    = "US+ Health - Inventory Forecast"
 HISTORY_FILE  = Path(__file__).parent / "data" / "sales_history.json"
 
@@ -851,22 +852,122 @@ def _add_dashboard_charts(ss: gspread.Spreadsheet, sid: int, n_reorder_skus: int
         print(f"  Warning: could not add charts: {e}")
 
 
+# ── Hedda's FBA shipment sheet ────────────────────────────────────────────────
+
+def _read_hedda_shipments(gc: gspread.Client) -> dict:
+    """
+    Read Hedda's FBA shipment tracking sheet and return a dict keyed by ASIN:
+      { asin: {"shipment_id": str, "status": str, "eta": str, "units": int} }
+
+    Active statuses that mean stock is already on its way:
+      Working / Shipped / In Transit / Receiving
+    Closed / Cancelled / Deleted are ignored (no longer relevant).
+
+    Returns {} if the sheet is not shared or cannot be read.
+    """
+    ACTIVE = {"working", "shipped", "in transit", "receiving"}
+
+    try:
+        ss_h = gc.open_by_key(HEDDA_SHEET_ID)
+    except Exception:
+        print("  Hedda's sheet: not accessible — share with the service account to enable cross-reference")
+        return {}
+
+    shipments: dict = {}
+    try:
+        ws = ss_h.worksheets()[0]
+        rows = ws.get_all_values()
+        if not rows:
+            return {}
+
+        headers = [h.strip().lower() for h in rows[0]]
+
+        # Try to find columns by flexible name matching
+        def _col(names):
+            for name in names:
+                for i, h in enumerate(headers):
+                    if name in h:
+                        return i
+            return None
+
+        col_asin     = _col(["asin"])
+        col_shipment = _col(["shipment id", "shipment_id", "fba id"])
+        col_status   = _col(["status"])
+        col_eta      = _col(["eta", "arrival", "estimated", "delivery"])
+        col_units    = _col(["units", "qty", "quantity"])
+
+        if col_asin is None:
+            print(f"  Hedda's sheet: no ASIN column found. Headers: {rows[0]}")
+            return {}
+
+        print(f"  Hedda's sheet: {len(rows)-1} shipment rows found")
+
+        for row in rows[1:]:
+            if not row or len(row) <= col_asin:
+                continue
+            asin = row[col_asin].strip()
+            if not asin:
+                continue
+
+            status = row[col_status].strip() if col_status is not None and len(row) > col_status else ""
+            if status.lower() not in ACTIVE:
+                continue  # skip closed/cancelled/irrelevant rows
+
+            shipment_id = row[col_shipment].strip() if col_shipment is not None and len(row) > col_shipment else ""
+            eta         = row[col_eta].strip()      if col_eta      is not None and len(row) > col_eta      else ""
+            try:
+                units = int(row[col_units].replace(",", "")) if col_units is not None and len(row) > col_units and row[col_units].strip() else 0
+            except ValueError:
+                units = 0
+
+            # Keep the most recent active shipment per ASIN (last row wins)
+            shipments[asin] = {
+                "shipment_id": shipment_id,
+                "status":      status,
+                "eta":         eta,
+                "units":       units,
+            }
+
+        print(f"  Hedda's sheet: {len(shipments)} ASINs with active shipments")
+        return shipments
+
+    except Exception as e:
+        print(f"  Hedda's sheet: error reading — {e}")
+        return {}
+
+
 # ── Write: Action Items ────────────────────────────────────────────────────────
 
-def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame):
+def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, shipments: dict = {}):
     ws = _get_or_add_tab(ss, "Action Items")
     sid = ws.id
 
+    has_shipments = bool(shipments)
     HEADERS = ["SKU", "ASIN", "Product (Name + ASIN)", "Status", "Order Qty",
-               "Owner", "Target Date", "Priority", "Notes"]
+               "Shipment Status", "Owner", "Target Date", "Priority", "Notes"]
 
     priority_order = {"Reorder Now": 0, "Monitor": 1, "OK": 2, "Covered by Inbound": 3}
     sdf = df[df["status"].isin(["Reorder Now", "Monitor"])].sort_values(
         "status", key=lambda s: s.map(priority_order).fillna(4))
 
+    def _shipment_cell(asin: str) -> str:
+        s = shipments.get(asin)
+        if not s:
+            return ""
+        parts = [s["status"]]
+        if s["shipment_id"]:
+            parts.append(s["shipment_id"])
+        if s["eta"]:
+            parts.append(f"ETA {s['eta']}")
+        if s["units"]:
+            parts.append(f"{s['units']} units")
+        return " · ".join(parts)
+
     rows = [[
         r["sku"], r["asin"], _product_label(r["asin"], r.get("item_name", "")),
-        r["status"], int(r["order_qty"]), "", "", "", ""
+        r["status"], int(r["order_qty"]),
+        _shipment_cell(r["asin"]),
+        "", "", "", ""
     ] for _, r in sdf.iterrows()]
 
     ws.update([["Action Items — fill in Owner, Target Date, Priority below"]], "A1")
@@ -890,20 +991,39 @@ def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame):
     # Freeze
     reqs.append(_freeze_req(sid, rows=2))
 
-    # Status colors per row
+    SHIP_COL = HEADERS.index("Shipment Status")
+
+    # Per-row: status color + shipment column highlight
     for ri, (_, row) in enumerate(sdf.iterrows()):
+        # Status cell color
         color = STATUS_COLORS.get(row["status"])
         if color:
             reqs.append(_format_range_req(
                 sid, 2 + ri, 3, 3 + ri, 4,
                 _fmt_cell(bg=color, bold=True, halign="CENTER")))
 
-    # Column widths
-    for ci, w in enumerate([160, 110, 300, 140, 80, 120, 110, 90, 200]):
+        # Shipment Status cell — blue if active shipment exists, yellow-orange warning if Reorder Now with no shipment
+        asin = row["asin"]
+        has_active = asin in shipments
+        if has_active:
+            reqs.append(_format_range_req(
+                sid, 2 + ri, SHIP_COL, 3 + ri, SHIP_COL + 1,
+                _fmt_cell(bg={"red": 0.741, "green": 0.843, "blue": 0.933},
+                          bold=True, wrap=True)))
+        elif row["status"] == "Reorder Now" and has_shipments:
+            # Reorder Now but no shipment tracked — highlight to act
+            reqs.append(_format_range_req(
+                sid, 2 + ri, SHIP_COL, 3 + ri, SHIP_COL + 1,
+                _fmt_cell(bg={"red": 1.0, "green": 0.78, "blue": 0.808},
+                          fg={"red": 0.6, "green": 0.0, "blue": 0.0})))
+
+    # Column widths — added Shipment Status at index 5
+    for ci, w in enumerate([160, 110, 280, 140, 80, 200, 120, 110, 90, 200]):
         reqs.append(_col_width_req(sid, ci, w))
 
     ss.batch_update({"requests": reqs})
-    print(f"  'Action Items' updated — {len(rows)} flagged SKUs")
+    matched = sum(1 for _, r in sdf.iterrows() if r["asin"] in shipments)
+    print(f"  'Action Items' updated — {len(rows)} flagged SKUs, {matched} with active shipments")
 
 
 # ── Write: Stock Snapshots (daily available-stock log, append-only) ───────────
@@ -1329,11 +1449,14 @@ def run():
     print(f"      Sheet: {ss.title}")
     print(f"      URL: https://docs.google.com/spreadsheets/d/{ss.id}")
 
+    print("\n      Checking Hedda's shipment sheet...")
+    shipments = _read_hedda_shipments(gc)
+
     print("\n[5/5] Writing tabs...")
     write_instructions_tab(ss)
     write_forecast_tab(ss, forecast_df, months)
     write_dashboard_tab(ss, forecast_df)
-    write_action_items_tab(ss, forecast_df)
+    write_action_items_tab(ss, forecast_df, shipments)
     write_sales_history_tab(ss, forecast_df, months)
     write_stock_history_tab(ss, forecast_df)
 
