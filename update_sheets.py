@@ -902,6 +902,7 @@ def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame):
 # ── Write: Stock Snapshots (daily available-stock log, append-only) ───────────
 
 def write_stock_history_tab(ss: gspread.Spreadsheet, df: pd.DataFrame):
+    import re as _re
     TAB_NAME = "Stock Snapshots"
 
     # Migrate: delete old "Stock History" tab if it exists
@@ -917,15 +918,18 @@ def write_stock_history_tab(ss: gspread.Spreadsheet, df: pd.DataFrame):
         ws = ss.add_worksheet(title=TAB_NAME, rows=500, cols=50)
     sid = ws.id
 
-    today    = datetime.date.today().isoformat()
-    existing = ws.get_all_values()
+    today         = datetime.date.today().isoformat()
+    existing      = ws.get_all_values()
+    current_asins = [r["asin"] for _, r in df.iterrows()]
 
-    # First run: write header row with product name + ASIN
-    if not existing or existing[0] == []:
-        header = ["Date"] + [
+    def _build_header():
+        return ["Date"] + [
             f"{ASIN_NAMES.get(r['asin'], r.get('item_name', r['asin'])[:28])}\n({r['asin']})"
             for _, r in df.iterrows()
         ]
+
+    def _write_header(header: list):
+        ws.clear()
         ws.update([header], "A1")
         reqs = [
             _format_range_req(sid, 0, 0, 1, len(header),
@@ -933,11 +937,31 @@ def write_stock_history_tab(ss: gspread.Spreadsheet, df: pd.DataFrame):
                           halign="CENTER", valign="MIDDLE", wrap=True)),
             _row_height_req(sid, 0, 52),
             _freeze_req(sid, rows=1, cols=1),
-            _col_width_req(sid, 0, 95),   # Date column
+            _col_width_req(sid, 0, 95),
         ]
         for ci in range(1, len(header)):
             reqs.append(_col_width_req(sid, ci, 115))
         ss.batch_update({"requests": reqs})
+
+    # Parse ASINs out of the existing header to detect stale/pre-consolidation columns
+    existing_asins = []
+    if existing and existing[0]:
+        for cell in existing[0][1:]:   # skip "Date"
+            m = _re.search(r'\(([A-Z0-9]{10})\)', cell)
+            if m:
+                existing_asins.append(m.group(1))
+
+    header_stale = existing_asins != current_asins
+    if header_stale:
+        if existing_asins:
+            print(f"  '{TAB_NAME}' header changed (consolidation/inactive filter) — resetting tab")
+        header = _build_header()
+        _write_header(header)
+        existing = [header]
+
+    elif not existing or not existing[0]:
+        header = _build_header()
+        _write_header(header)
         existing = [header]
 
     # Don't double-log the same day
@@ -946,10 +970,12 @@ def write_stock_history_tab(ss: gspread.Spreadsheet, df: pd.DataFrame):
         print(f"  '{TAB_NAME}' already has today's snapshot — skipped")
         return
 
-    snapshot = [today] + [int(row["available"]) for _, row in df.iterrows()]
-    next_row  = len(existing) + 1
+    # Build snapshot row by ASIN lookup (not positional) so order can never drift
+    asin_stock = {r["asin"]: int(r["available"]) for _, r in df.iterrows()}
+    snapshot   = [today] + [asin_stock.get(asin, 0) for asin in current_asins]
+    next_row   = len(existing) + 1
     ws.update([snapshot], f"A{next_row}")
-    print(f"  '{TAB_NAME}' snapshot added for {today} ({len(df)} SKUs)")
+    print(f"  '{TAB_NAME}' snapshot added for {today} ({len(df)} ASINs)")
 
 
 # ── Write: Instructions ───────────────────────────────────────────────────────
@@ -1162,6 +1188,94 @@ def write_sales_history_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: l
     print(f"  'Sales History' updated — {len(rows)} SKUs, {len(months)} months")
 
 
+# ── Slack notification ─────────────────────────────────────────────────────────
+
+def _notify_slack(df: pd.DataFrame, sheet_id: str):
+    webhook = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+    if not webhook:
+        print("  Slack: SLACK_WEBHOOK_URL not set — skipping notification")
+        return
+
+    counts    = df["status"].value_counts()
+    reorder_n = int(counts.get("Reorder Now", 0))
+    monitor_n = int(counts.get("Monitor", 0))
+    ok_n      = int(counts.get("OK", 0))
+    covered_n = int(counts.get("Covered by Inbound", 0))
+    sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+    today_str = datetime.date.today().strftime("%b %d, %Y")
+
+    # Header emoji based on urgency
+    header_emoji = "🚨" if reorder_n > 0 else ("⚠️" if monitor_n > 0 else "✅")
+
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text",
+                     "text": f"{header_emoji}  Inventory Update — {today_str}"}
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*🔴 Reorder Now*\n{reorder_n} item{'s' if reorder_n != 1 else ''}"},
+                {"type": "mrkdwn", "text": f"*🟠 Monitor*\n{monitor_n} item{'s' if monitor_n != 1 else ''}"},
+                {"type": "mrkdwn", "text": f"*🟢 OK*\n{ok_n} item{'s' if ok_n != 1 else ''}"},
+                {"type": "mrkdwn", "text": f"*🔵 Covered by Inbound*\n{covered_n} item{'s' if covered_n != 1 else ''}"},
+            ]
+        },
+        {"type": "divider"},
+    ]
+
+    # Reorder Now items
+    reorder_rows = df[df["status"] == "Reorder Now"].sort_values("order_qty", ascending=False)
+    if not reorder_rows.empty:
+        lines = []
+        for _, r in reorder_rows.iterrows():
+            name = ASIN_NAMES.get(r["asin"], r.get("item_name", r["asin"]))
+            dos  = r["days_of_stock"]
+            dos_str = f"{int(dos)}d stock" if dos and dos < 9999 else "0 stock"
+            lines.append(f"• *{name}* — order *{int(r['order_qty'])} units*  _{dos_str}_")
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn",
+                     "text": "*🔴 Reorder Now:*\n" + "\n".join(lines)}
+        })
+
+    # Monitor items
+    monitor_rows = df[df["status"] == "Monitor"].sort_values("days_of_stock")
+    if not monitor_rows.empty:
+        lines = []
+        for _, r in monitor_rows.iterrows():
+            name = ASIN_NAMES.get(r["asin"], r.get("item_name", r["asin"]))
+            dos  = r["days_of_stock"]
+            dos_str = f"{int(dos)} days left" if dos and dos < 9999 else "low stock"
+            lines.append(f"• {name} — _{dos_str}_")
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn",
+                     "text": "*🟠 Monitor:*\n" + "\n".join(lines)}
+        })
+
+    blocks.append({
+        "type": "actions",
+        "elements": [{
+            "type": "button",
+            "text": {"type": "plain_text", "text": "📊 Open Inventory Sheet"},
+            "url": sheet_url,
+            "style": "primary",
+        }]
+    })
+
+    try:
+        resp = httpx.post(webhook, json={"blocks": blocks}, timeout=10,
+                          verify=certifi.where())
+        if resp.status_code == 200:
+            print(f"  Slack: notification sent to #inventory-forecasting")
+        else:
+            print(f"  Slack: unexpected response {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"  Slack: failed to send notification — {e}")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def run():
@@ -1184,6 +1298,20 @@ def run():
 
     print("\n[3/5] Running forecast calculations...")
     forecast_df = run_forecast(inventory, sales, months)
+
+    # Drop inactive products: no stock anywhere AND no sales in 6-month window
+    active_mask = (
+        (forecast_df["available"] > 0) |
+        (forecast_df["inbound"] > 0) |
+        (forecast_df[months].sum(axis=1) > 0)
+    )
+    inactive = forecast_df[~active_mask]
+    if len(inactive) > 0:
+        print(f"      Removed {len(inactive)} inactive ASINs (no stock, no sales):")
+        for _, r in inactive.iterrows():
+            print(f"        {r['asin']}  {ASIN_NAMES.get(r['asin'], r.get('item_name',''))}")
+        forecast_df = forecast_df[active_mask].reset_index(drop=True)
+
     reorder = (forecast_df["status"] == "Reorder Now").sum()
     print(f"      {reorder} SKUs flagged for reorder")
 
@@ -1202,8 +1330,11 @@ def run():
     write_sales_history_tab(ss, forecast_df, months)
     write_stock_history_tab(ss, forecast_df)
 
+    sheet_id = os.environ["FORECAST_SHEET_ID"].strip()
+    _notify_slack(forecast_df, sheet_id)
+
     print(f"\nDone. Open your sheet:")
-    print(f"  https://docs.google.com/spreadsheets/d/{ss.id}\n")
+    print(f"  https://docs.google.com/spreadsheets/d/{sheet_id}\n")
 
 
 if __name__ == "__main__":

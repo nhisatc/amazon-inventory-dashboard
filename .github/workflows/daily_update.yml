@@ -37,6 +37,7 @@ jobs:
           MARKETPLACE_ID:        ATVPDKIKX0DER
           FORECAST_SHEET_ID:     ${{ secrets.FORECAST_SHEET_ID }}
           GOOGLE_CREDENTIALS_PATH: /tmp/google_creds.json
+          SLACK_WEBHOOK_URL:     ${{ secrets.SLACK_WEBHOOK_URL }}
         run: python update_sheets.py
 
       - name: Save updated sales history back to repo
