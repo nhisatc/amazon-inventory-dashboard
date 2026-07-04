@@ -58,6 +58,14 @@ STATUS_COLORS = {
     "Monitor":            {"red": 1.0,   "green": 0.922, "blue": 0.612},
     "OK":                 {"red": 0.776, "green": 0.937, "blue": 0.808},
     "Covered by Inbound": {"red": 0.741, "green": 0.843, "blue": 0.933},
+    "Hold":               {"red": 0.851, "green": 0.776, "blue": 0.937},
+}
+
+# ASINs flagged for manual hold — reorder suppressed regardless of stock level.
+# Add an ASIN here when the business situation overrides the model (e.g. aged
+# inventory clearance, product discontinuation, seasonal pause).
+HOLD_ASINS = {
+    "B0DDWQ1515": "Aged inventory clearance — $825.64 surcharge Jul 15. Sell down FBA stock before reordering.",
 }
 HEADER_COLOR  = {"red": 0.122, "green": 0.306, "blue": 0.475}   # #1F4E79
 HEADER2_COLOR = {"red": 0.173, "green": 0.243, "blue": 0.314}   # darker accent
@@ -286,7 +294,13 @@ def run_forecast(inventory: pd.DataFrame, sales: pd.DataFrame, months: list[str]
     df["trend"]        = df.apply(
         lambda r: (r["avg_3mo"] - r["avg_prev3mo"]) / r["avg_prev3mo"]
         if r["avg_prev3mo"] > 0 else 0, axis=1)
-    df["forecast"]     = (df["avg_3mo"] * (1 + df["trend"])).clip(lower=0).round().astype(int)
+    # Cap trend at ±30% to prevent a single dip/spike month from distorting the forecast,
+    # then blend 70% trend-adjusted 3-month avg with 30% 6-month avg for stability.
+    df["trend_capped"] = df["trend"].clip(-0.30, 0.30)
+    df["forecast"]     = (
+        0.70 * df["avg_3mo"] * (1 + df["trend_capped"]) +
+        0.30 * df["avg_6mo"]
+    ).clip(lower=0).round().astype(int)
     df["std_dev"]      = df[months].std(axis=1, ddof=1).fillna(0)
     lt_mo              = LEAD_DAYS / 30
     df["safety_stock"] = (Z_SCORE * df["std_dev"] * math.sqrt(lt_mo)).round().astype(int)
@@ -296,7 +310,7 @@ def run_forecast(inventory: pd.DataFrame, sales: pd.DataFrame, months: list[str]
     #   - Order enough to cover TARGET_MONTHS demand, netting out available + inbound only
     df["order_qty"] = df.apply(
         lambda r: max(0, round(r["forecast"] * TARGET_MONTHS - r["available"] - r["inbound"]))
-        if r["available"] < r["reorder_point"] else 0, axis=1)
+        if (r["available"] + r["inbound"]) < r["reorder_point"] else 0, axis=1)
     df["days_of_stock"]= df.apply(
         lambda r: round(r["available"] / (r["forecast"] / 30), 1)
         if r["forecast"] > 0 else (None if r["available"] == 0 else 9999), axis=1)
@@ -854,6 +868,64 @@ def _add_dashboard_charts(ss: gspread.Spreadsheet, sid: int, n_reorder_skus: int
 
 # ── Hedda's FBA shipment sheet ────────────────────────────────────────────────
 
+def _ensure_hedda_planned_tab(ss_h: gspread.Spreadsheet) -> None:
+    """Create the 'Planned Shipments' tab in Hedda's sheet if it doesn't exist."""
+    existing = [ws.title for ws in ss_h.worksheets()]
+    if "Planned Shipments" in existing:
+        return
+
+    ws  = ss_h.add_worksheet(title="Planned Shipments", rows=100, cols=5)
+    sid = ws.id
+
+    HEADERS = ["ASIN", "Product Name", "Units Planned", "Target Ship Date", "Notes"]
+    ws.update([HEADERS], "A1")
+
+    reqs = []
+    # Header row styling
+    reqs.append(_format_range_req(sid, 0, 0, 1, 5,
+        _fmt_cell(bg=HEADER_COLOR, bold=True, fg=WHITE, halign="CENTER")))
+    reqs.append(_row_height_req(sid, 0, 32))
+    reqs.append(_freeze_req(sid, rows=1))
+    # Column widths
+    for ci, w in enumerate([160, 220, 120, 140, 260]):
+        reqs.append(_col_width_req(sid, ci, w))
+
+    ss_h.batch_update({"requests": reqs})
+    print("  Hedda's sheet: created 'Planned Shipments' tab")
+
+
+def _read_hedda_planned(ss_h: gspread.Spreadsheet) -> dict:
+    """
+    Read the 'Planned Shipments' tab in Hedda's sheet.
+    Columns: A=ASIN, B=Product Name, C=Units Planned, D=Target Ship Date, E=Notes
+    Returns {asin: {"units": int, "ship_by": str, "notes": str}}
+    """
+    try:
+        ws   = ss_h.worksheet("Planned Shipments")
+        rows = ws.get_all_values()
+        if len(rows) < 2:
+            return {}
+        planned = {}
+        for row in rows[1:]:
+            if not row or not row[0].strip():
+                continue
+            asin = row[0].strip().upper()
+            try:
+                units = int(row[2].replace(",", "")) if len(row) > 2 and row[2].strip() else 0
+            except ValueError:
+                units = 0
+            ship_by = row[3].strip() if len(row) > 3 else ""
+            notes   = row[4].strip() if len(row) > 4 else ""
+            if asin not in planned:
+                planned[asin] = {"units": 0, "ship_by": ship_by, "notes": notes}
+            planned[asin]["units"] += units
+        print(f"  Hedda's sheet: {len(planned)} ASINs with planned shipments")
+        return planned
+    except Exception as e:
+        print(f"  Hedda's sheet: error reading Planned Shipments — {e}")
+        return {}
+
+
 def _read_hedda_shipments(gc: gspread.Client) -> dict:
     """
     Read Hedda's FBA Shipment Tracker and return a dict keyed by ASIN.
@@ -876,7 +948,7 @@ def _read_hedda_shipments(gc: gspread.Client) -> dict:
         ss_h = gc.open_by_key(HEDDA_SHEET_ID)
     except Exception:
         print("  Hedda's sheet: not accessible — share with the service account to enable cross-reference")
-        return {}
+        return {}, {}
 
     try:
         ws   = ss_h.worksheet("Shipment Tracker")
@@ -929,16 +1001,18 @@ def _read_hedda_shipments(gc: gspread.Client) -> dict:
             }
 
         print(f"  Hedda's sheet: {len(rows)-1} rows → {len(shipments)} ASINs with active shipments")
-        return shipments
+        _ensure_hedda_planned_tab(ss_h)
+        planned = _read_hedda_planned(ss_h)
+        return shipments, planned
 
     except Exception as e:
         print(f"  Hedda's sheet: error reading — {e}")
-        return {}
+        return {}, {}
 
 
 # ── Write: Action Items ────────────────────────────────────────────────────────
 
-def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, shipments: dict = {}):
+def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, shipments: dict = {}, planned: dict = {}):
     ws = _get_or_add_tab(ss, "Action Items")
     sid = ws.id
 
@@ -951,24 +1025,50 @@ def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, shipments:
         "status", key=lambda s: s.map(priority_order).fillna(4))
 
     def _shipment_cell(asin: str) -> str:
+        parts = []
         s = shipments.get(asin)
-        if not s:
-            return ""
-        label = f"{s['n']} shipment{'s' if s['n'] != 1 else ''}"
-        parts = [f"{label} ({s['status']})"]
-        if s["units"]:
-            parts.append(f"{s['units']:,} units inbound")
-        if s["fcs"]:
-            parts.append(f"→ {s['fcs']}")
-        if s["ids"]:
-            parts.append(s["ids"])
+        if s:
+            label = f"{s['n']} shipment{'s' if s['n'] != 1 else ''}"
+            parts.append(f"{label} ({s['status']})")
+            if s["units"]:
+                parts.append(f"{s['units']:,} units inbound")
+            if s["fcs"]:
+                parts.append(f"→ {s['fcs']}")
+            if s["ids"]:
+                parts.append(s["ids"])
+        p = planned.get(asin)
+        if p:
+            plan_line = f"📋 Planned: {p['units']:,} units"
+            if p["ship_by"]:
+                plan_line += f" — ship by {p['ship_by']}"
+            parts.append(plan_line)
+            if p["notes"]:
+                parts.append(f"  {p['notes']}")
         return "\n".join(parts)
+
+    # Preserve any user-entered Owner / Target Date / Priority / Notes keyed by ASIN
+    user_data: dict[str, list] = {}
+    try:
+        existing = ws.get_all_values()
+        if len(existing) > 2:
+            for erow in existing[2:]:
+                if len(erow) > 1 and erow[1]:
+                    user_data[erow[1]] = [
+                        erow[6] if len(erow) > 6 else "",
+                        erow[7] if len(erow) > 7 else "",
+                        erow[8] if len(erow) > 8 else "",
+                        erow[9] if len(erow) > 9 else "",
+                    ]
+    except Exception:
+        pass
+
+    ws.clear()  # wipe stale rows from previous runs before rewriting
 
     rows = [[
         r["sku"], r["asin"], _product_label(r["asin"], r.get("item_name", "")),
         r["status"], int(r["order_qty"]),
         _shipment_cell(r["asin"]),
-        "", "", "", ""
+        *user_data.get(r["asin"], ["", "", "", ""])
     ] for _, r in sdf.iterrows()]
 
     ws.update([["Action Items — fill in Owner, Target Date, Priority below"]], "A1")
@@ -1003,16 +1103,32 @@ def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, shipments:
                 sid, 2 + ri, 3, 3 + ri, 4,
                 _fmt_cell(bg=color, bold=True, halign="CENTER")))
 
-        # Shipment Status cell — blue if active shipment exists, yellow-orange warning if Reorder Now with no shipment
-        asin = row["asin"]
-        has_active = asin in shipments
-        if has_active:
+        # Shipment Status cell coloring
+        # Blue  = active inbound shipment
+        # Teal  = planned only (no active shipment yet)
+        # Red   = Reorder Now with nothing tracked at all
+        asin        = row["asin"]
+        has_active  = asin in shipments
+        has_planned = asin in planned
+        if has_active and has_planned:
+            # Both active + planned — blue (active takes priority visually)
             reqs.append(_format_range_req(
                 sid, 2 + ri, SHIP_COL, 3 + ri, SHIP_COL + 1,
                 _fmt_cell(bg={"red": 0.741, "green": 0.843, "blue": 0.933},
                           bold=True, wrap=True)))
-        elif row["status"] == "Reorder Now" and has_shipments:
-            # Reorder Now but no shipment tracked — highlight to act
+        elif has_active:
+            reqs.append(_format_range_req(
+                sid, 2 + ri, SHIP_COL, 3 + ri, SHIP_COL + 1,
+                _fmt_cell(bg={"red": 0.741, "green": 0.843, "blue": 0.933},
+                          bold=True, wrap=True)))
+        elif has_planned:
+            # Planned but not yet shipped — light teal
+            reqs.append(_format_range_req(
+                sid, 2 + ri, SHIP_COL, 3 + ri, SHIP_COL + 1,
+                _fmt_cell(bg={"red": 0.776, "green": 0.937, "blue": 0.929},
+                          bold=True, wrap=True)))
+        elif row["status"] == "Reorder Now":
+            # Nothing tracked at all — red warning
             reqs.append(_format_range_req(
                 sid, 2 + ri, SHIP_COL, 3 + ri, SHIP_COL + 1,
                 _fmt_cell(bg={"red": 1.0, "green": 0.78, "blue": 0.808},
@@ -1136,6 +1252,7 @@ def write_instructions_tab(ss: gspread.Spreadsheet):
         ("🟠  Monitor", "Available is within 20% of Reorder Point — watch closely, may need to order soon.", False),
         ("🟢  OK", "Available is more than 20% above Reorder Point. No action needed.", False),
         ("🔵  Covered by Inbound", "Available < Reorder Point but inbound shipment is on its way to cover the gap.", False),
+        ("🟣  Hold", "Manually flagged — do not reorder. Business situation overrides the model (e.g. aged inventory clearance, discontinuation). Edit HOLD_ASINS in the script to add/remove.", False),
         ("", "", False),
         ("TABS EXPLAINED", "", "subheader"),
         ("Dashboard", "KPI summary cards + charts. Refreshes on every run.", False),
@@ -1316,14 +1433,65 @@ def write_sales_history_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: l
     print(f"  'Sales History' updated — {len(rows)} SKUs, {len(months)} months")
 
 
+# ── Reorder state persistence ──────────────────────────────────────────────────
+
+STATE_FILE = Path(__file__).parent / "data" / "reorder_state.json"
+
+def _load_reorder_state() -> dict:
+    """Load the previous run's reorder snapshot. Returns {} if no file yet."""
+    try:
+        if STATE_FILE.exists():
+            return json.loads(STATE_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+def _save_reorder_state(df: pd.DataFrame) -> None:
+    """Persist current Reorder Now + Monitor ASINs so the next run can diff."""
+    reorder = {
+        r["asin"]: {"name": ASIN_NAMES.get(r["asin"], r.get("item_name", "")),
+                    "order_qty": int(r["order_qty"])}
+        for _, r in df[df["status"] == "Reorder Now"].iterrows()
+    }
+    monitor = {
+        r["asin"]: {"name": ASIN_NAMES.get(r["asin"], r.get("item_name", ""))}
+        for _, r in df[df["status"] == "Monitor"].iterrows()
+    }
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(
+        {"date": str(datetime.date.today()), "reorder": reorder, "monitor": monitor},
+        indent=2))
+
+
 # ── Slack notification ─────────────────────────────────────────────────────────
 
-def _notify_slack(df: pd.DataFrame, sheet_id: str):
+def _notify_slack(df: pd.DataFrame, sheet_id: str, prev_state: dict = {}):
     webhook = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
     if not webhook:
         print("  Slack: SLACK_WEBHOOK_URL not set — skipping notification")
         return
 
+    # ── Decide whether to notify ──────────────────────────────────────────────
+    curr_reorder = {
+        r["asin"]: int(r["order_qty"])
+        for _, r in df[df["status"] == "Reorder Now"].iterrows()
+    }
+    prev_reorder = {a: v.get("order_qty", 0)
+                    for a, v in prev_state.get("reorder", {}).items()}
+
+    new_asins      = [a for a in curr_reorder if a not in prev_reorder]
+    resolved_asins = [a for a in prev_reorder if a not in curr_reorder]
+    qty_changed    = [a for a in curr_reorder
+                      if a in prev_reorder and curr_reorder[a] != prev_reorder[a]]
+
+    is_friday   = datetime.date.today().weekday() == 4   # 0=Mon … 4=Fri
+    has_changes = bool(new_asins or resolved_asins or qty_changed)
+
+    if not has_changes and not is_friday:
+        print("  Slack: no changes since last run — skipping notification")
+        return
+
+    # ── Build message ─────────────────────────────────────────────────────────
     counts    = df["status"].value_counts()
     reorder_n = int(counts.get("Reorder Now", 0))
     monitor_n = int(counts.get("Monitor", 0))
@@ -1332,14 +1500,24 @@ def _notify_slack(df: pd.DataFrame, sheet_id: str):
     sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}"
     today_str = datetime.date.today().strftime("%b %d, %Y")
 
-    # Header emoji based on urgency
+    if has_changes:
+        change_parts = []
+        if new_asins:
+            change_parts.append(f"🆕 {len(new_asins)} new")
+        if resolved_asins:
+            change_parts.append(f"✅ {len(resolved_asins)} resolved")
+        if qty_changed:
+            change_parts.append(f"📈 {len(qty_changed)} qty updated")
+        header_text = f"🚨 Inventory Changes — {today_str}  ({', '.join(change_parts)})"
+    else:
+        header_text = f"📋 Weekly Recap — {today_str}  (no changes this week)"
+
     header_emoji = "🚨" if reorder_n > 0 else ("⚠️" if monitor_n > 0 else "✅")
 
     blocks = [
         {
             "type": "header",
-            "text": {"type": "plain_text",
-                     "text": f"{header_emoji}  Inventory Update — {today_str}"}
+            "text": {"type": "plain_text", "text": header_text}
         },
         {
             "type": "section",
@@ -1352,6 +1530,27 @@ def _notify_slack(df: pd.DataFrame, sheet_id: str):
         },
         {"type": "divider"},
     ]
+
+    # What changed section (only when there are changes)
+    if has_changes:
+        change_lines = []
+        for a in new_asins:
+            name = ASIN_NAMES.get(a, a)
+            change_lines.append(f"🆕 *{name}* — newly flagged, order {curr_reorder[a]:,} units")
+        for a in resolved_asins:
+            name = ASIN_NAMES.get(a, prev_state["reorder"].get(a, {}).get("name", a))
+            change_lines.append(f"✅ *{name}* — no longer needs reordering")
+        for a in qty_changed:
+            name = ASIN_NAMES.get(a, a)
+            old_qty = prev_reorder[a]
+            new_qty = curr_reorder[a]
+            direction = "▲" if new_qty > old_qty else "▼"
+            change_lines.append(f"📈 *{name}* — qty {direction} {old_qty:,} → {new_qty:,}")
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "\n".join(change_lines)}
+        })
+        blocks.append({"type": "divider"})
 
     # Reorder Now items
     reorder_rows = df[df["status"] == "Reorder Now"].sort_values("order_qty", ascending=False)
@@ -1440,6 +1639,15 @@ def run():
             print(f"        {r['asin']}  {ASIN_NAMES.get(r['asin'], r.get('item_name',''))}")
         forecast_df = forecast_df[active_mask].reset_index(drop=True)
 
+    # Apply manual hold overrides — zero out order_qty and set status to "Hold"
+    for hold_asin, hold_reason in HOLD_ASINS.items():
+        mask = forecast_df["asin"] == hold_asin
+        if mask.any():
+            forecast_df.loc[mask, "status"]    = "Hold"
+            forecast_df.loc[mask, "order_qty"] = 0
+            print(f"      Hold override: {hold_asin} ({ASIN_NAMES.get(hold_asin, hold_asin)})")
+            print(f"        Reason: {hold_reason}")
+
     reorder = (forecast_df["status"] == "Reorder Now").sum()
     print(f"      {reorder} SKUs flagged for reorder")
 
@@ -1451,18 +1659,20 @@ def run():
     print(f"      URL: https://docs.google.com/spreadsheets/d/{ss.id}")
 
     print("\n      Checking Hedda's shipment sheet...")
-    shipments = _read_hedda_shipments(gc)
+    shipments, planned = _read_hedda_shipments(gc)
 
     print("\n[5/5] Writing tabs...")
     write_instructions_tab(ss)
     write_forecast_tab(ss, forecast_df, months)
     write_dashboard_tab(ss, forecast_df)
-    write_action_items_tab(ss, forecast_df, shipments)
+    write_action_items_tab(ss, forecast_df, shipments, planned)
     write_sales_history_tab(ss, forecast_df, months)
     write_stock_history_tab(ss, forecast_df)
 
-    sheet_id = os.environ["FORECAST_SHEET_ID"].strip()
-    _notify_slack(forecast_df, sheet_id)
+    sheet_id   = os.environ["FORECAST_SHEET_ID"].strip()
+    prev_state = _load_reorder_state()
+    _notify_slack(forecast_df, sheet_id, prev_state)
+    _save_reorder_state(forecast_df)
 
     print(f"\nDone. Open your sheet:")
     print(f"  https://docs.google.com/spreadsheets/d/{sheet_id}\n")

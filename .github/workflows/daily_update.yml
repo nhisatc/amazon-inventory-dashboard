@@ -44,6 +44,6 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/sales_history.json
-          git diff --staged --quiet || git commit -m "chore: update sales history [skip ci]"
+          git add data/sales_history.json data/reorder_state.json
+          git diff --staged --quiet || git commit -m "chore: update sales history + reorder state [skip ci]"
           git push
