@@ -19,6 +19,10 @@ import os, sys, json, datetime, time, gzip, math
 from pathlib import Path
 import certifi, httpx
 
+# Ensure Unicode characters (e.g. → in Hedda's sheet headers) don't crash on Windows console
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # SSL fix for Windows — must happen before sp_api imports
 _orig = httpx.Client
 class _SSL(httpx.Client):
@@ -305,12 +309,11 @@ def run_forecast(inventory: pd.DataFrame, sales: pd.DataFrame, months: list[str]
     lt_mo              = LEAD_DAYS / 30
     df["safety_stock"] = (Z_SCORE * df["std_dev"] * math.sqrt(lt_mo)).round().astype(int)
     df["reorder_point"]= (df["safety_stock"] + df["forecast"] * lt_mo).round().astype(int)
-    # Order qty mirrors Venus's formula:
-    #   - Only order if available < reorder_point (reserved stock doesn't inflate the trigger)
-    #   - Order enough to cover TARGET_MONTHS demand, netting out available + inbound only
+    # Order qty: only trigger if (available + inbound + reserved) < reorder_point,
+    # then order enough to cover TARGET_MONTHS demand netting out all pipeline stock.
     df["order_qty"] = df.apply(
-        lambda r: max(0, round(r["forecast"] * TARGET_MONTHS - r["available"] - r["inbound"]))
-        if (r["available"] + r["inbound"]) < r["reorder_point"] else 0, axis=1)
+        lambda r: max(0, round(r["forecast"] * TARGET_MONTHS - r["available"] - r["inbound"] - r["reserved"]))
+        if (r["available"] + r["inbound"] + r["reserved"]) < r["reorder_point"] else 0, axis=1)
     df["days_of_stock"]= df.apply(
         lambda r: round(r["available"] / (r["forecast"] / 30), 1)
         if r["forecast"] > 0 else (None if r["available"] == 0 else 9999), axis=1)
@@ -318,7 +321,7 @@ def run_forecast(inventory: pd.DataFrame, sales: pd.DataFrame, months: list[str]
     def _status(r):
         if r["order_qty"] > 0:
             return "Reorder Now"
-        if r["available"] < r["reorder_point"] and r["inbound"] > 0:
+        if r["available"] < r["reorder_point"] and (r["inbound"] > 0 or r["reserved"] > 0):
             return "Covered by Inbound"
         if r["available"] < r["reorder_point"] * 1.2:  # 20% buffer = early warning zone
             return "Monitor"
@@ -446,7 +449,7 @@ def write_forecast_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: list[s
 
     # Row 2: headers
     HEADERS = (
-        ["SKU", "ASIN", "Product (Name + ASIN)", "Lead Time (Days)",
+        ["Product (Name + ASIN)", "ASIN", "SKU", "Lead Time (Days)",
          "Available Stock", "Inbound Stock", "Reserved Stock"]
         + month_labels
         + ["Avg Monthly Demand (6-mo)", "3-Mo Moving Avg", "Trend (%)",
@@ -460,7 +463,7 @@ def write_forecast_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: list[s
     for _, row in df.iterrows():
         dos = row["days_of_stock"]
         r = (
-            [row["sku"], row["asin"], _product_label(row["asin"], row.get("item_name", "")), LEAD_DAYS,
+            [_product_label(row["asin"], row.get("item_name", "")), row["asin"], row["sku"], LEAD_DAYS,
              int(row["available"]), int(row["inbound"]), int(row["reserved"])]
             + [int(row.get(m, 0)) for m in months]
             + [_clean(round(row["avg_6mo"], 1)), _clean(round(row["avg_3mo"], 1)),
@@ -511,7 +514,7 @@ def write_forecast_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: list[s
 
     # Column widths
     col_widths = (
-        [160, 110, 280, 80, 80, 80, 80]   # SKU, ASIN, Name, lead, avail, inbound, reserved
+        [280, 110, 160, 80, 80, 80, 80]   # Name, ASIN, SKU, lead, avail, inbound, reserved
         + [70] * len(months)               # month columns
         + [90, 90, 70, 90, 70, 80, 90, 80, 130, 80]  # calc columns
     )
@@ -1017,7 +1020,7 @@ def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, shipments:
     sid = ws.id
 
     has_shipments = bool(shipments)
-    HEADERS = ["SKU", "ASIN", "Product (Name + ASIN)", "Status", "Order Qty",
+    HEADERS = ["Product (Name + ASIN)", "ASIN", "SKU", "Status", "Order Qty",
                "Shipment Status", "Owner", "Target Date", "Priority", "Notes"]
 
     priority_order = {"Reorder Now": 0, "Monitor": 1, "OK": 2, "Covered by Inbound": 3}
@@ -1065,7 +1068,7 @@ def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, shipments:
     ws.clear()  # wipe stale rows from previous runs before rewriting
 
     rows = [[
-        r["sku"], r["asin"], _product_label(r["asin"], r.get("item_name", "")),
+        _product_label(r["asin"], r.get("item_name", "")), r["asin"], r["sku"],
         r["status"], int(r["order_qty"]),
         _shipment_cell(r["asin"]),
         *user_data.get(r["asin"], ["", "", "", ""])
@@ -1351,7 +1354,7 @@ def write_sales_history_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: l
     sid = ws.id
 
     month_labels = [datetime.datetime.strptime(m, "%Y-%m").strftime("%b %Y") for m in months]
-    HEADERS = ["SKU", "ASIN", "Product", "Category"] + month_labels + ["6-Mo Total"]
+    HEADERS = ["Product", "ASIN", "SKU", "Category"] + month_labels + ["6-Mo Total"]
 
     # Category lookup from the known ASIN → category mapping
     ASIN_CATEGORY = {
@@ -1369,9 +1372,9 @@ def write_sales_history_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: l
         monthly = [int(row.get(m, 0)) for m in months]
         total   = sum(monthly)
         rows.append([
-            row["sku"],
-            row["asin"],
             _product_label(row["asin"], row.get("item_name", "")),
+            row["asin"],
+            row["sku"],
             ASIN_CATEGORY.get(row["asin"], "Other"),
         ] + monthly + [total])
 
@@ -1425,12 +1428,80 @@ def write_sales_history_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: l
                               halign="CENTER")))
 
     # Column widths
-    col_widths = [150, 110, 250, 120] + [75] * len(months) + [90]
+    col_widths = [250, 110, 150, 120] + [75] * len(months) + [90]
     for ci, w in enumerate(col_widths):
         reqs.append(_col_width_req(sid, ci, w))
 
     ss.batch_update({"requests": reqs})
     print(f"  'Sales History' updated — {len(rows)} SKUs, {len(months)} months")
+
+
+# ── Write: Shipment Tracker (mirror of Hedda's Shipment Tracker tab) ───────────
+
+def write_shipment_tracker_tab(ss: gspread.Spreadsheet, gc: gspread.Client) -> None:
+    """Mirror Hedda's Shipment Tracker tab into the dashboard."""
+    ws = _get_or_add_tab(ss, "Shipment Tracker")
+    sid = ws.id
+
+    try:
+        hedda_ss = gc.open_by_key(HEDDA_SHEET_ID)
+        src = next((w for w in hedda_ss.worksheets() if w.id == 535816787), None)
+        if src is None:
+            print("  Shipment Tracker: tab not found in Hedda's sheet — skipping")
+            return
+        all_rows = src.get_all_values()
+    except Exception as e:
+        print(f"  Shipment Tracker: could not read Hedda's sheet — {e}")
+        return
+
+    if not all_rows:
+        print("  Shipment Tracker: Hedda's tab is empty — skipping")
+        return
+
+    headers  = all_rows[0]
+    data     = all_rows[1:]
+    n_cols   = len(headers)
+
+    ws.clear()
+    ws.update([headers] + data, "A1")
+
+    STATUS_COL = next((i for i, h in enumerate(headers) if "status" in h.lower()), None)
+    SHIPMENT_COLORS = {
+        "in transit":  {"red": 0.741, "green": 0.843, "blue": 0.933},  # light blue
+        "receiving":   {"red": 1.0,   "green": 0.922, "blue": 0.612},  # yellow
+        "closed":      {"red": 0.776, "green": 0.937, "blue": 0.808},  # green
+        "delivered":   {"red": 0.776, "green": 0.937, "blue": 0.808},  # green
+        "cancelled":   {"red": 0.9,   "green": 0.9,   "blue": 0.9},    # grey
+    }
+
+    reqs = []
+
+    # Header row
+    reqs.append(_format_range_req(sid, 0, 0, 1, n_cols,
+        _fmt_cell(bg=HEADER_COLOR, bold=True, fg={"red": 1, "green": 1, "blue": 1},
+                  halign="CENTER", wrap=True)))
+    reqs.append(_row_height_req(sid, 0, 42))
+
+    # Freeze header row + first column (Shipment ID)
+    reqs.append(_freeze_req(sid, rows=1, cols=1))
+
+    # Status color rows
+    if STATUS_COL is not None:
+        for ri, row in enumerate(data):
+            if len(row) > STATUS_COL:
+                status_key = row[STATUS_COL].strip().lower()
+                color = SHIPMENT_COLORS.get(status_key)
+                if color:
+                    reqs.append(_format_range_req(sid, 1 + ri, 0, 2 + ri, n_cols,
+                        _fmt_cell(bg=color)))
+
+    # Column widths
+    col_widths = [150, 110, 110, 120, 70, 130, 110, 90, 110, 110, 100, 80, 90, 90, 90, 130, 110, 100, 100, 180]
+    for ci, w in enumerate(col_widths[:n_cols]):
+        reqs.append(_col_width_req(sid, ci, w))
+
+    ss.batch_update({"requests": reqs})
+    print(f"  'Shipment Tracker' mirrored — {len(data)} shipments")
 
 
 # ── Reorder state persistence ──────────────────────────────────────────────────
@@ -1668,6 +1739,7 @@ def run():
     write_action_items_tab(ss, forecast_df, shipments, planned)
     write_sales_history_tab(ss, forecast_df, months)
     write_stock_history_tab(ss, forecast_df)
+    write_shipment_tracker_tab(ss, gc)
 
     sheet_id   = os.environ["FORECAST_SHEET_ID"].strip()
     prev_state = _load_reorder_state()

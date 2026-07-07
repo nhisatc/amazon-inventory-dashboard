@@ -3,27 +3,19 @@
   "reorder": {
     "B08Y83DNZ5": {
       "name": "Hydrogen Peroxide 3% 1 Gal",
-      "order_qty": 1184
+      "order_qty": 1075
     },
     "B097LTHS4S": {
       "name": "Vegetable Glycerin 32oz",
-      "order_qty": 4760
-    },
-    "B0981HX5NG": {
-      "name": "Mineral Oil 8oz",
-      "order_qty": 6
+      "order_qty": 1626
     },
     "B0BR99MF15": {
       "name": "Vegetable Glycerin 1 Gal",
-      "order_qty": 4346
-    },
-    "B0CCMHLX72": {
-      "name": "Castor Oil 20oz",
-      "order_qty": 2
+      "order_qty": 2247
     },
     "B0DSCKXPQH": {
       "name": "Organic Jojoba Oil 16oz",
-      "order_qty": 171
+      "order_qty": 158
     }
   },
   "monitor": {
