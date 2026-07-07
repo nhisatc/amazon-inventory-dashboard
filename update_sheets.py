@@ -142,7 +142,8 @@ def fetch_inventory() -> pd.DataFrame:
                 "asin":      item.get("asin", ""),
                 "item_name": item.get("productName", ""),
                 "available": d.get("fulfillableQuantity", 0) or 0,
-                "inbound":   (d.get("inboundShippedQuantity", 0) or 0)
+                "inbound":   (d.get("inboundWorkingQuantity", 0) or 0)
+                           + (d.get("inboundShippedQuantity", 0) or 0)
                            + (d.get("inboundReceivingQuantity", 0) or 0),
                 "reserved":  rv.get("totalReservedQuantity", 0) or 0,
             })
