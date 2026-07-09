@@ -930,6 +930,65 @@ def _read_hedda_planned(ss_h: gspread.Spreadsheet) -> dict:
         return {}
 
 
+def _ensure_hedda_production_tab(ss_h: gspread.Spreadsheet) -> None:
+    """Create 'Planned Production' tab in Hedda's sheet if it doesn't exist, pre-seeded with CO16."""
+    existing = [ws.title for ws in ss_h.worksheets()]
+    if "Planned Production" in existing:
+        return
+
+    ws  = ss_h.add_worksheet(title="Planned Production", rows=100, cols=5)
+    sid = ws.id
+
+    HEADERS = ["ASIN", "Product Name", "Units Planned", "Expected Completion", "Notes"]
+    seed_row = ["B0DDWQ1515", "Organic Castor Oil 16oz", "8000", "", "Run 1 — Julian to confirm Run 2 (est. 6k)"]
+    ws.update([HEADERS, seed_row], "A1")
+
+    reqs = []
+    reqs.append(_format_range_req(sid, 0, 0, 1, 5,
+        _fmt_cell(bg={"red": 0.992, "green": 0.573, "blue": 0.047},  # amber header
+                  bold=True, fg={"red": 1, "green": 1, "blue": 1}, halign="CENTER")))
+    reqs.append(_row_height_req(sid, 0, 32))
+    reqs.append(_freeze_req(sid, rows=1))
+    for ci, w in enumerate([160, 220, 120, 160, 300]):
+        reqs.append(_col_width_req(sid, ci, w))
+
+    ss_h.batch_update({"requests": reqs})
+    print("  Hedda's sheet: created 'Planned Production' tab (seeded with CO16 8k)")
+
+
+def _read_hedda_production(ss_h: gspread.Spreadsheet) -> dict:
+    """
+    Read 'Planned Production' tab in Hedda's sheet.
+    Columns: A=ASIN, B=Product Name, C=Units Planned, D=Expected Completion, E=Notes
+    Returns {asin: {"units": int, "completion": str, "notes": str}}
+    Multiple rows per ASIN are aggregated (sum of units).
+    """
+    try:
+        ws   = ss_h.worksheet("Planned Production")
+        rows = ws.get_all_values()
+        if len(rows) < 2:
+            return {}
+        production = {}
+        for row in rows[1:]:
+            if not row or not row[0].strip():
+                continue
+            asin = row[0].strip().upper()
+            try:
+                units = int(row[2].replace(",", "")) if len(row) > 2 and row[2].strip() else 0
+            except ValueError:
+                units = 0
+            completion = row[3].strip() if len(row) > 3 else ""
+            notes      = row[4].strip() if len(row) > 4 else ""
+            if asin not in production:
+                production[asin] = {"units": 0, "completion": completion, "notes": notes}
+            production[asin]["units"] += units
+        print(f"  Hedda's sheet: {len(production)} ASINs with planned production runs")
+        return production
+    except Exception as e:
+        print(f"  Hedda's sheet: error reading Planned Production — {e}")
+        return {}
+
+
 def _read_hedda_shipments(gc: gspread.Client) -> dict:
     """
     Read Hedda's FBA Shipment Tracker and return a dict keyed by ASIN.
@@ -1006,17 +1065,19 @@ def _read_hedda_shipments(gc: gspread.Client) -> dict:
 
         print(f"  Hedda's sheet: {len(rows)-1} rows → {len(shipments)} ASINs with active shipments")
         _ensure_hedda_planned_tab(ss_h)
-        planned = _read_hedda_planned(ss_h)
-        return shipments, planned
+        planned    = _read_hedda_planned(ss_h)
+        _ensure_hedda_production_tab(ss_h)
+        production = _read_hedda_production(ss_h)
+        return shipments, planned, production
 
     except Exception as e:
         print(f"  Hedda's sheet: error reading — {e}")
-        return {}, {}
+        return {}, {}, {}
 
 
 # ── Write: Action Items ────────────────────────────────────────────────────────
 
-def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, shipments: dict = {}, planned: dict = {}):
+def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, shipments: dict = {}, planned: dict = {}, production: dict = {}):
     ws = _get_or_add_tab(ss, "Action Items")
     sid = ws.id
 
@@ -1042,12 +1103,20 @@ def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, shipments:
                 parts.append(s["ids"])
         p = planned.get(asin)
         if p:
-            plan_line = f"📋 Planned: {p['units']:,} units"
+            plan_line = f"📋 Planned FBA: {p['units']:,} units"
             if p["ship_by"]:
                 plan_line += f" — ship by {p['ship_by']}"
             parts.append(plan_line)
             if p["notes"]:
                 parts.append(f"  {p['notes']}")
+        pr = production.get(asin)
+        if pr:
+            prod_line = f"🏭 Production run: {pr['units']:,} units"
+            if pr["completion"]:
+                prod_line += f" — est. completion {pr['completion']}"
+            parts.append(prod_line)
+            if pr["notes"]:
+                parts.append(f"  {pr['notes']}")
         return "\n".join(parts)
 
     # Preserve any user-entered Owner / Target Date / Priority / Notes keyed by ASIN
@@ -1731,13 +1800,13 @@ def run():
     print(f"      URL: https://docs.google.com/spreadsheets/d/{ss.id}")
 
     print("\n      Checking Hedda's shipment sheet...")
-    shipments, planned = _read_hedda_shipments(gc)
+    shipments, planned, production = _read_hedda_shipments(gc)
 
     print("\n[5/5] Writing tabs...")
     write_instructions_tab(ss)
     write_forecast_tab(ss, forecast_df, months)
     write_dashboard_tab(ss, forecast_df)
-    write_action_items_tab(ss, forecast_df, shipments, planned)
+    write_action_items_tab(ss, forecast_df, shipments, planned, production)
     write_sales_history_tab(ss, forecast_df, months)
     write_stock_history_tab(ss, forecast_df)
     write_shipment_tracker_tab(ss, gc)
