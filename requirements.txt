@@ -6,3 +6,5 @@ certifi
 httpx
 python-dotenv
 openpyxl
+slack_bolt
+anthropic

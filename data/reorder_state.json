@@ -1,17 +1,21 @@
 {
-  "date": "2026-07-09",
+  "date": "2026-07-08",
   "reorder": {
     "B08Y83DNZ5": {
       "name": "Hydrogen Peroxide 3% 1 Gal",
-      "order_qty": 1077
+      "order_qty": 1075
+    },
+    "B097LTHS4S": {
+      "name": "Vegetable Glycerin 32oz",
+      "order_qty": 1627
     },
     "B0BR99MF15": {
       "name": "Vegetable Glycerin 1 Gal",
-      "order_qty": 2297
+      "order_qty": 2252
     },
     "B0DSCKXPQH": {
       "name": "Organic Jojoba Oil 16oz",
-      "order_qty": 165
+      "order_qty": 158
     }
   },
   "monitor": {
