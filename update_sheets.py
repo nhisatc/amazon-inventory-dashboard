@@ -92,6 +92,15 @@ ASIN_NAMES = {
 }
 
 
+def _col_letter(n: int) -> str:
+    """Convert 0-based column index to A1 column letter (handles AA, AB, etc.)."""
+    result, n = "", n + 1
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        result = chr(65 + r) + result
+    return result
+
+
 def _product_label(asin: str, item_name: str) -> str:
     """Return 'Short Name (ASIN)' using the known name map, or truncated API title."""
     short = ASIN_NAMES.get(asin, "")
@@ -135,17 +144,20 @@ def fetch_inventory() -> pd.DataFrame:
             kw["nextToken"] = next_token
         resp = api.get_inventory_summary_marketplace(**kw).payload
         for item in resp.get("inventorySummaries", []):
-            d  = item.get("inventoryDetails", {})
-            rv = d.get("reservedQuantity", {})
+            d    = item.get("inventoryDetails", {})
+            rv   = d.get("reservedQuantity", {})
+            unf  = d.get("unfulfillableQuantity", {})
             rows.append({
-                "sku":       item.get("sellerSku", ""),
-                "asin":      item.get("asin", ""),
-                "item_name": item.get("productName", ""),
-                "available": d.get("fulfillableQuantity", 0) or 0,
-                "inbound":   (d.get("inboundWorkingQuantity", 0) or 0)
-                           + (d.get("inboundShippedQuantity", 0) or 0)
-                           + (d.get("inboundReceivingQuantity", 0) or 0),
-                "reserved":  rv.get("totalReservedQuantity", 0) or 0,
+                "sku":          item.get("sellerSku", ""),
+                "asin":         item.get("asin", ""),
+                "item_name":    item.get("productName", ""),
+                "available":    d.get("fulfillableQuantity", 0) or 0,
+                "inbound":      (d.get("inboundWorkingQuantity", 0) or 0)
+                              + (d.get("inboundShippedQuantity", 0) or 0)
+                              + (d.get("inboundReceivingQuantity", 0) or 0),
+                "reserved":     rv.get("totalReservedQuantity", 0) or 0,
+                "unfulfillable": unf.get("totalUnfulfillableQuantity", 0) or 0,
+                "expired":      unf.get("expiredQuantity", 0) or 0,
             })
         next_token = resp.get("pagination", {}).get("nextToken")
         if not next_token:
@@ -195,10 +207,12 @@ def _consolidate_by_asin(df: pd.DataFrame) -> pd.DataFrame:
             "sku":       best["sku"],
             "asin":      asin,
             "item_name": best["item_name"],
-            "available": int(group["available"].sum()),
-            "inbound":   int(group["inbound"].sum()),
-            "reserved":  int(group["reserved"].sum()),
-            "fbm":       0,  # filled in after fetch_fbm_inventory()
+            "available":     int(group["available"].sum()),
+            "inbound":       int(group["inbound"].sum()),
+            "reserved":      int(group["reserved"].sum()),
+            "unfulfillable": int(group["unfulfillable"].sum()),
+            "expired":       int(group["expired"].sum()),
+            "fbm":           0,  # filled in after fetch_fbm_inventory()
         })
     consolidated = pd.DataFrame(result)
     dupes = df.groupby("asin").size()
@@ -479,7 +493,8 @@ def write_forecast_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: list[s
     # Row 2: headers
     HEADERS = (
         ["Product (Name + ASIN)", "ASIN", "SKU", "Lead Time (Days)",
-         "Available Stock (FBA)", "Inbound Stock (FBA)", "Reserved Stock (FBA)", "Warehouse Stock (FBM)"]
+         "Available Stock (FBA)", "Inbound Stock (FBA)", "Reserved Stock (FBA)", "Warehouse Stock (FBM)",
+         "Unfulfillable (FBA)", "Expired (FBA)"]
         + month_labels
         + ["Avg Monthly Demand (6-mo)", "3-Mo Moving Avg", "Trend (%)",
            "Forecasted Demand", "Std Dev", "Safety Stock", "Reorder Point",
@@ -493,7 +508,8 @@ def write_forecast_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: list[s
         dos = row["days_of_stock"]
         r = (
             [_product_label(row["asin"], row.get("item_name", "")), row["asin"], row["sku"], LEAD_DAYS,
-             int(row["available"]), int(row["inbound"]), int(row["reserved"]), int(row.get("fbm", 0))]
+             int(row["available"]), int(row["inbound"]), int(row["reserved"]), int(row.get("fbm", 0)),
+             int(row.get("unfulfillable", 0)), int(row.get("expired", 0))]
             + [int(row.get(m, 0)) for m in months]
             + [_clean(round(row["avg_6mo"], 1)), _clean(round(row["avg_3mo"], 1)),
                _clean(round(row["trend"], 4)),
@@ -508,11 +524,11 @@ def write_forecast_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: list[s
         ws.update(rows, "A3")
 
     # Sparkline column header + formulas (trend line per SKU)
-    spark_col_letter = chr(ord("A") + len(HEADERS))   # column right after last header
+    spark_col_letter = _col_letter(len(HEADERS))   # column right after last header
     ws.update([["Trend"]], f"{spark_col_letter}2")
     spark_formulas = []
-    month_start_col = chr(ord("A") + 8)               # column I = first month (after FBM col)
-    month_end_col   = chr(ord("A") + 7 + len(months)) # last month column
+    month_start_col = _col_letter(10)              # column K = first month (after 10 fixed cols)
+    month_end_col   = _col_letter(9 + len(months)) # last month column
     for ri in range(3, 3 + len(rows)):
         spark_formulas.append([
             f'=SPARKLINE({month_start_col}{ri}:{month_end_col}{ri},'
@@ -543,7 +559,7 @@ def write_forecast_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: list[s
 
     # Column widths
     col_widths = (
-        [280, 110, 160, 80, 100, 100, 100, 110]  # Name, ASIN, SKU, lead, avail(FBA), inbound(FBA), reserved(FBA), warehouse(FBM)
+        [280, 110, 160, 80, 100, 100, 100, 110, 110, 80]  # Name, ASIN, SKU, lead, avail(FBA), inbound(FBA), reserved(FBA), FBM, unfulfillable, expired
         + [70] * len(months)               # month columns
         + [90, 90, 70, 90, 70, 80, 90, 80, 130, 80]  # calc columns
     )
@@ -561,14 +577,25 @@ def write_forecast_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: list[s
         }
     })
 
-    # Status cell colors (per row)
-    status_col_0 = HEADERS.index("Status")
+    # Status cell colors (per row) + expired unit warning
+    status_col_0   = HEADERS.index("Status")
+    expired_col_0  = HEADERS.index("Expired (FBA)")
+    unf_col_0      = HEADERS.index("Unfulfillable (FBA)")
     for ri, (_, row) in enumerate(df.iterrows()):
         color = STATUS_COLORS.get(row["status"])
         if color:
             reqs.append(_format_range_req(
                 sid, 2 + ri, status_col_0, 3 + ri, status_col_0 + 1,
                 _fmt_cell(bg=color, bold=True, halign="CENTER")))
+        # Highlight unfulfillable column amber; expired column red if > 0
+        if int(row.get("unfulfillable", 0)) > 0:
+            reqs.append(_format_range_req(
+                sid, 2 + ri, unf_col_0, 3 + ri, unf_col_0 + 1,
+                _fmt_cell(bg={"red": 1.0, "green": 0.922, "blue": 0.612}, bold=True, halign="CENTER")))
+        if int(row.get("expired", 0)) > 0:
+            reqs.append(_format_range_req(
+                sid, 2 + ri, expired_col_0, 3 + ri, expired_col_0 + 1,
+                _fmt_cell(bg={"red": 1.0, "green": 0.6, "blue": 0.6}, bold=True, halign="CENTER")))
 
     # Sparkline column header format + width
     spark_col_idx = len(HEADERS)
@@ -577,7 +604,7 @@ def write_forecast_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: list[s
     ss.batch_update({"requests": reqs})
 
     # Format sparkline header (must happen after batch_update since _hdr writes directly)
-    spark_col_letter2 = chr(ord("A") + len(HEADERS))
+    spark_col_letter2 = _col_letter(len(HEADERS))
     ws.update([["6-Mo Trend"]], f"{spark_col_letter2}2")
 
     print(f"  'Forecast & Reorder' updated — {len(rows)} SKUs")
@@ -1114,13 +1141,18 @@ def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, shipments:
                "Shipment Status", "Owner", "Target Date", "Priority", "Notes"]
 
     priority_order = {"Reorder Now": 0, "Monitor": 1, "OK": 2, "Covered by Inbound": 3}
-    sdf = df[df["status"].isin(["Reorder Now", "Monitor"])].sort_values(
+    has_expired = df.get("expired", pd.Series(0, index=df.index)).gt(0)
+    sdf = df[df["status"].isin(["Reorder Now", "Monitor"]) | has_expired].sort_values(
         "status", key=lambda s: s.map(priority_order).fillna(4))
 
-    def _shipment_cell(asin: str, fbm_units: int = 0) -> str:
+    def _shipment_cell(asin: str, fbm_units: int = 0, expired_units: int = 0, unf_units: int = 0) -> str:
         parts = []
         if fbm_units > 0:
             parts.append(f"🏪 {fbm_units:,} units at warehouse (FBM)")
+        if expired_units > 0:
+            parts.append(f"⚠️ {expired_units:,} expired units at Amazon — create removal order")
+        elif unf_units > 0:
+            parts.append(f"⚠️ {unf_units:,} unfulfillable units at Amazon (damaged/other)")
         s = shipments.get(asin)
         if s:
             label = f"{s['n']} shipment{'s' if s['n'] != 1 else ''}"
@@ -1170,7 +1202,8 @@ def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, shipments:
     rows = [[
         _product_label(r["asin"], r.get("item_name", "")), r["asin"], r["sku"],
         r["status"], int(r["order_qty"]),
-        _shipment_cell(r["asin"], int(r.get("fbm", 0))),
+        _shipment_cell(r["asin"], int(r.get("fbm", 0)),
+                       int(r.get("expired", 0)), int(r.get("unfulfillable", 0))),
         *user_data.get(r["asin"], ["", "", "", ""])
     ] for _, r in sdf.iterrows()]
 
