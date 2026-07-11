@@ -153,6 +153,33 @@ def fetch_inventory() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def fetch_fbm_inventory() -> dict:
+    """Fetch merchant-fulfilled (FBM/warehouse) stock per ASIN from SP-API.
+    Returns {asin: units} — zero means no FBM listing or no stock."""
+    try:
+        api = Inventories(credentials=SP_CREDS, marketplace=_marketplace(), verify=SSL_VERIFY)
+        fbm, next_token = {}, None
+        while True:
+            kw = dict(details=True, fulfillmentChannelCode="DEFAULT")
+            if next_token:
+                kw["nextToken"] = next_token
+            resp = api.get_inventory_summary_marketplace(**kw).payload
+            for item in resp.get("inventorySummaries", []):
+                asin  = item.get("asin", "")
+                d     = item.get("inventoryDetails", {})
+                units = d.get("fulfillableQuantity", 0) or 0
+                if asin and units > 0:
+                    fbm[asin] = fbm.get(asin, 0) + units
+            next_token = resp.get("pagination", {}).get("nextToken")
+            if not next_token:
+                break
+        print(f"      FBM: {len(fbm)} ASINs with warehouse stock")
+        return fbm
+    except Exception as e:
+        print(f"      FBM: could not fetch — {e}")
+        return {}
+
+
 def _consolidate_by_asin(df: pd.DataFrame) -> pd.DataFrame:
     """Merge rows that share the same ASIN (multiple SKUs → one row per product).
     Sums available/inbound/reserved. Picks the SKU with most available stock,
@@ -171,6 +198,7 @@ def _consolidate_by_asin(df: pd.DataFrame) -> pd.DataFrame:
             "available": int(group["available"].sum()),
             "inbound":   int(group["inbound"].sum()),
             "reserved":  int(group["reserved"].sum()),
+            "fbm":       0,  # filled in after fetch_fbm_inventory()
         })
     consolidated = pd.DataFrame(result)
     dupes = df.groupby("asin").size()
@@ -451,7 +479,7 @@ def write_forecast_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: list[s
     # Row 2: headers
     HEADERS = (
         ["Product (Name + ASIN)", "ASIN", "SKU", "Lead Time (Days)",
-         "Available Stock", "Inbound Stock", "Reserved Stock"]
+         "Available Stock (FBA)", "Inbound Stock (FBA)", "Reserved Stock (FBA)", "Warehouse Stock (FBM)"]
         + month_labels
         + ["Avg Monthly Demand (6-mo)", "3-Mo Moving Avg", "Trend (%)",
            "Forecasted Demand", "Std Dev", "Safety Stock", "Reorder Point",
@@ -465,7 +493,7 @@ def write_forecast_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: list[s
         dos = row["days_of_stock"]
         r = (
             [_product_label(row["asin"], row.get("item_name", "")), row["asin"], row["sku"], LEAD_DAYS,
-             int(row["available"]), int(row["inbound"]), int(row["reserved"])]
+             int(row["available"]), int(row["inbound"]), int(row["reserved"]), int(row.get("fbm", 0))]
             + [int(row.get(m, 0)) for m in months]
             + [_clean(round(row["avg_6mo"], 1)), _clean(round(row["avg_3mo"], 1)),
                _clean(round(row["trend"], 4)),
@@ -483,8 +511,8 @@ def write_forecast_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: list[s
     spark_col_letter = chr(ord("A") + len(HEADERS))   # column right after last header
     ws.update([["Trend"]], f"{spark_col_letter}2")
     spark_formulas = []
-    month_start_col = chr(ord("A") + 7)               # column H = first month
-    month_end_col   = chr(ord("A") + 6 + len(months)) # last month column
+    month_start_col = chr(ord("A") + 8)               # column I = first month (after FBM col)
+    month_end_col   = chr(ord("A") + 7 + len(months)) # last month column
     for ri in range(3, 3 + len(rows)):
         spark_formulas.append([
             f'=SPARKLINE({month_start_col}{ri}:{month_end_col}{ri},'
@@ -515,7 +543,7 @@ def write_forecast_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: list[s
 
     # Column widths
     col_widths = (
-        [280, 110, 160, 80, 80, 80, 80]   # Name, ASIN, SKU, lead, avail, inbound, reserved
+        [280, 110, 160, 80, 100, 100, 100, 110]  # Name, ASIN, SKU, lead, avail(FBA), inbound(FBA), reserved(FBA), warehouse(FBM)
         + [70] * len(months)               # month columns
         + [90, 90, 70, 90, 70, 80, 90, 80, 130, 80]  # calc columns
     )
@@ -1089,8 +1117,10 @@ def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, shipments:
     sdf = df[df["status"].isin(["Reorder Now", "Monitor"])].sort_values(
         "status", key=lambda s: s.map(priority_order).fillna(4))
 
-    def _shipment_cell(asin: str) -> str:
+    def _shipment_cell(asin: str, fbm_units: int = 0) -> str:
         parts = []
+        if fbm_units > 0:
+            parts.append(f"🏪 {fbm_units:,} units at warehouse (FBM)")
         s = shipments.get(asin)
         if s:
             label = f"{s['n']} shipment{'s' if s['n'] != 1 else ''}"
@@ -1140,7 +1170,7 @@ def write_action_items_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, shipments:
     rows = [[
         _product_label(r["asin"], r.get("item_name", "")), r["asin"], r["sku"],
         r["status"], int(r["order_qty"]),
-        _shipment_cell(r["asin"]),
+        _shipment_cell(r["asin"], int(r.get("fbm", 0))),
         *user_data.get(r["asin"], ["", "", "", ""])
     ] for _, r in sdf.iterrows()]
 
@@ -1757,6 +1787,7 @@ def run():
     print(f"      {len(inventory)} SKUs found")
     inventory = _consolidate_by_asin(inventory)
     print(f"      {len(inventory)} unique ASINs after consolidation")
+    fbm_data = fetch_fbm_inventory()
 
     asins = inventory["asin"].dropna().unique().tolist()
 
@@ -1766,6 +1797,10 @@ def run():
 
     print("\n[3/5] Running forecast calculations...")
     forecast_df = run_forecast(inventory, sales, months)
+    forecast_df["fbm"] = forecast_df["asin"].map(fbm_data).fillna(0).astype(int)
+    if fbm_data:
+        fbm_total = sum(fbm_data.values())
+        print(f"      FBM warehouse stock mapped: {len(fbm_data)} ASINs, {fbm_total:,} total units")
 
     # Drop inactive products: no stock anywhere AND no sales in 6-month window
     active_mask = (
