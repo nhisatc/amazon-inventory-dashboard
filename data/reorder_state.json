@@ -1,13 +1,9 @@
 {
-  "date": "2026-07-10",
+  "date": "2026-07-11",
   "reorder": {
     "B08Y83DNZ5": {
       "name": "Hydrogen Peroxide 3% 1 Gal",
       "order_qty": 1078
-    },
-    "B0BR99MF15": {
-      "name": "Vegetable Glycerin 1 Gal",
-      "order_qty": 2067
     },
     "B0DSCKXPQH": {
       "name": "Organic Jojoba Oil 16oz",
@@ -15,6 +11,9 @@
     }
   },
   "monitor": {
+    "B08Y7X8375": {
+      "name": "Hydrogen Peroxide 3% 32oz"
+    },
     "B09DZ2P2WJ": {
       "name": "Sweet Almond Oil 1 Gal"
     }
