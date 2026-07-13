@@ -69,7 +69,7 @@ STATUS_COLORS = {
 # Add an ASIN here when the business situation overrides the model (e.g. aged
 # inventory clearance, product discontinuation, seasonal pause).
 HOLD_ASINS = {
-    "B0DDWQ1515": "Aged inventory clearance — $825.64 surcharge Jul 15. Sell down FBA stock before reordering.",
+    "B0DDWQ1515": "Stock re-certified to 03/2028. New supply arriving ~Jul 21. Price raised to $17.99 to slow to ~200 units/wk while supply comes in. Hold until new stock confirmed at FBA.",
 }
 HEADER_COLOR  = {"red": 0.122, "green": 0.306, "blue": 0.475}   # #1F4E79
 HEADER2_COLOR = {"red": 0.173, "green": 0.243, "blue": 0.314}   # darker accent
