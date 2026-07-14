@@ -70,6 +70,7 @@ STATUS_COLORS = {
 # inventory clearance, product discontinuation, seasonal pause).
 HOLD_ASINS = {
     "B0DDWQ1515": "Stock re-certified to 03/2028. New supply arriving next week (date TBC with Julian). Price raised to $17.99 to slow to ~200 units/wk while supply comes in. Hold until new stock confirmed at FBA.",
+    "B08Y83DNZ5": "Intentionally selling FBM only — 9,500 units listed in warehouse. Will switch back to FBA in a couple months.",
 }
 HEADER_COLOR  = {"red": 0.122, "green": 0.306, "blue": 0.475}   # #1F4E79
 HEADER2_COLOR = {"red": 0.173, "green": 0.243, "blue": 0.314}   # darker accent
