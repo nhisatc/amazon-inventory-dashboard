@@ -365,7 +365,7 @@ def run_forecast(inventory: pd.DataFrame, sales: pd.DataFrame, months: list[str]
     def _status(r):
         if r["order_qty"] > 0:
             return "Reorder Now"
-        if r["available"] < r["reorder_point"] and (r["inbound"] > 0 or r["reserved"] > 0):
+        if r["available"] < r["reorder_point"] and r["inbound"] > 0:
             return "Covered by Inbound"
         if r["available"] < r["reorder_point"] * 1.2:  # 20% buffer = early warning zone
             return "Monitor"
