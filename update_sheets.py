@@ -367,6 +367,9 @@ def run_forecast(inventory: pd.DataFrame, sales: pd.DataFrame, months: list[str]
             return "Reorder Now"
         if r["available"] < r["reorder_point"] and r["inbound"] > 0:
             return "Covered by Inbound"
+        dos = r.get("days_of_stock") or 0
+        if dos > 90:  # 3+ months of stock — never Monitor regardless of unit-based reorder point
+            return "OK"
         if r["available"] < r["reorder_point"] * 1.2:  # 20% buffer = early warning zone
             return "Monitor"
         return "OK"
