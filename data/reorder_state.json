@@ -1,13 +1,13 @@
 {
-  "date": "2026-07-31",
+  "date": "2026-08-01",
   "reorder": {
     "B0BR99MF15": {
       "name": "Vegetable Glycerin 1 Gal",
-      "order_qty": 955
+      "order_qty": 624
     },
     "B0DSCKXPQH": {
       "name": "Organic Jojoba Oil 16oz",
-      "order_qty": 184
+      "order_qty": 106
     }
   },
   "monitor": {
