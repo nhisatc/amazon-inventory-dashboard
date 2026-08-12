@@ -1,9 +1,13 @@
 {
-  "date": "2026-08-11",
+  "date": "2026-08-12",
   "reorder": {
     "B0BR99MF15": {
       "name": "Vegetable Glycerin 1 Gal",
-      "order_qty": 2422
+      "order_qty": 2671
+    },
+    "B0CCMHLX72": {
+      "name": "Castor Oil 20oz",
+      "order_qty": 2
     }
   },
   "monitor": {
@@ -15,9 +19,6 @@
     },
     "B09DZ2P2WJ": {
       "name": "Sweet Almond Oil 1 Gal"
-    },
-    "B0CCMHLX72": {
-      "name": "Castor Oil 20oz"
     }
   }
 }
