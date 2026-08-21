@@ -1,13 +1,13 @@
 {
-  "date": "2026-08-20",
+  "date": "2026-08-21",
   "reorder": {
     "B0981HX5NG": {
       "name": "Mineral Oil 8oz",
-      "order_qty": 6
+      "order_qty": 8
     },
     "B0BR99MF15": {
       "name": "Vegetable Glycerin 1 Gal",
-      "order_qty": 3551
+      "order_qty": 3645
     },
     "B0CCMHLX72": {
       "name": "Castor Oil 20oz",
@@ -23,9 +23,6 @@
     },
     "B09DZ2P2WJ": {
       "name": "Sweet Almond Oil 1 Gal"
-    },
-    "B0BJH3RD1F": {
-      "name": "Mineral Oil 32oz"
     }
   }
 }
