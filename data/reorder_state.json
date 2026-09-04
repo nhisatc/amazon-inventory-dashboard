@@ -1,5 +1,5 @@
 {
-  "date": "2026-09-03",
+  "date": "2026-09-04",
   "reorder": {
     "B0981HX5NG": {
       "name": "Mineral Oil 8oz",
@@ -7,15 +7,15 @@
     },
     "B09CV925V4": {
       "name": "Castor Oil 10oz",
-      "order_qty": 301
+      "order_qty": 319
     },
     "B0BR99MF15": {
       "name": "Vegetable Glycerin 1 Gal",
-      "order_qty": 1938
+      "order_qty": 2069
     },
     "B0CCMHLX72": {
       "name": "Castor Oil 20oz",
-      "order_qty": 3
+      "order_qty": 2
     }
   },
   "monitor": {
