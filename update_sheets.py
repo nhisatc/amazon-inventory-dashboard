@@ -1874,6 +1874,28 @@ def run():
     print("\n      Checking Hedda's shipment sheet...")
     shipments, planned, production = _read_hedda_shipments(gc)
 
+    # Supplement "Covered by Inbound" with Hedda's tracker for shipments not yet
+    # visible in SP-API (e.g. freight booked outside Amazon's system).
+    hedda_covered = []
+    for asin, s in shipments.items():
+        if s.get("units", 0) <= 0:
+            continue
+        mask = forecast_df["asin"] == asin
+        if not mask.any():
+            continue
+        r = forecast_df[mask].iloc[0]
+        if (r["inbound"] == 0
+                and r["available"] < r["reorder_point"]
+                and r["status"] not in ("Reorder Now", "Hold")):
+            forecast_df.loc[mask, "status"] = "Covered by Inbound"
+            hedda_covered.append(
+                f"{asin} ({ASIN_NAMES.get(asin, asin)}, {s['units']:,} units in Hedda's sheet)"
+            )
+    if hedda_covered:
+        print(f"      Covered by Inbound via Hedda's tracker: {len(hedda_covered)} ASIN(s)")
+        for note in hedda_covered:
+            print(f"        {note}")
+
     print("\n[5/5] Writing tabs...")
     write_instructions_tab(ss)
     write_forecast_tab(ss, forecast_df, months)
