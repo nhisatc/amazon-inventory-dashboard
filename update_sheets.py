@@ -1878,21 +1878,37 @@ def run():
     # visible in SP-API (e.g. freight booked outside Amazon's system).
     hedda_covered = []
     for asin, s in shipments.items():
-        if s.get("units", 0) <= 0:
+        hedda_units = s.get("units", 0)
+        if hedda_units <= 0:
             continue
         mask = forecast_df["asin"] == asin
         if not mask.any():
             continue
         r = forecast_df[mask].iloc[0]
-        if (r["inbound"] == 0
-                and r["available"] < r["reorder_point"]
-                and r["status"] not in ("Reorder Now", "Hold")):
-            forecast_df.loc[mask, "status"] = "Covered by Inbound"
+        # Skip if SP-API already shows inbound (already factored in) or product is on hold
+        if r["inbound"] > 0 or r["status"] == "Hold":
+            continue
+        # SP-API shows 0 inbound but Hedda has active units — supplement the calculation
+        combined  = int(r["available"]) + hedda_units + int(r["reserved"])
+        rp        = int(r["reorder_point"])
+        if combined >= rp:
+            # Hedda's inbound fully covers the gap → no reorder needed
+            forecast_df.loc[mask, "order_qty"] = 0
+            forecast_df.loc[mask, "status"]    = "Covered by Inbound"
             hedda_covered.append(
-                f"{asin} ({ASIN_NAMES.get(asin, asin)}, {s['units']:,} units in Hedda's sheet)"
+                f"{asin} ({ASIN_NAMES.get(asin, asin)}) — {hedda_units:,} Hedda units fully cover gap"
             )
+        elif int(r["available"]) < rp:
+            # Hedda's inbound partially covers — reduce order_qty by Hedda units
+            new_qty = max(0, rp - combined)
+            if new_qty < int(r["order_qty"]):
+                forecast_df.loc[mask, "order_qty"] = new_qty
+                hedda_covered.append(
+                    f"{asin} ({ASIN_NAMES.get(asin, asin)}) — order qty reduced to {new_qty:,} "
+                    f"after {hedda_units:,} Hedda units"
+                )
     if hedda_covered:
-        print(f"      Covered by Inbound via Hedda's tracker: {len(hedda_covered)} ASIN(s)")
+        print(f"      Hedda inbound supplement: {len(hedda_covered)} ASIN(s) updated")
         for note in hedda_covered:
             print(f"        {note}")
 
