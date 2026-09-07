@@ -1,20 +1,26 @@
 {
-  "date": "2026-07-18",
+  "date": "2026-09-07",
   "reorder": {
-    "B0DSCKXPQH": {
-      "name": "Organic Jojoba Oil 16oz",
-      "order_qty": 176
+    "B0981HX5NG": {
+      "name": "Mineral Oil 8oz",
+      "order_qty": 14
+    },
+    "B09CV925V4": {
+      "name": "Castor Oil 10oz",
+      "order_qty": 346
+    },
+    "B0BR99MF15": {
+      "name": "Vegetable Glycerin 1 Gal",
+      "order_qty": 2461
+    },
+    "B0CCMHLX72": {
+      "name": "Castor Oil 20oz",
+      "order_qty": 2
     }
   },
   "monitor": {
-    "B0981HX5NG": {
-      "name": "Mineral Oil 8oz"
-    },
     "B09DZ2P2WJ": {
       "name": "Sweet Almond Oil 1 Gal"
-    },
-    "B0CCMHLX72": {
-      "name": "Castor Oil 20oz"
     }
   }
 }
