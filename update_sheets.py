@@ -1064,7 +1064,10 @@ def _read_hedda_shipments(gc: gspread.Client) -> dict:
     Active statuses: In transit | Receiving | Pending Pickup
     Returns {} if sheet is not accessible.
     """
-    ACTIVE = {"in transit", "receiving", "pending pickup"}
+    ACTIVE     = {"in transit", "receiving", "pending pickup"}
+    # "Receiving" is already visible in SP-API inboundReceivingQuantity — don't double-count.
+    # Only "In Transit" and "Pending Pickup" are invisible to SP-API.
+    NOT_IN_API = {"in transit", "pending pickup"}
 
     try:
         ss_h = gc.open_by_key(HEDDA_SHEET_ID)
@@ -1078,7 +1081,7 @@ def _read_hedda_shipments(gc: gspread.Client) -> dict:
         if len(rows) < 2:
             return {}
 
-        # {asin: {shipment_ids, statuses, total_units, pickup_dates, dest_fcs}}
+        # {asin: {shipment_ids, statuses, total_units, units_not_in_api, pickup_dates, dest_fcs}}
         by_asin: dict = {}
 
         for row in rows[1:]:
@@ -1099,10 +1102,12 @@ def _read_hedda_shipments(gc: gspread.Client) -> dict:
 
             if asin not in by_asin:
                 by_asin[asin] = {"ids": [], "statuses": set(), "units": 0,
-                                 "dates": [], "fcs": []}
+                                 "units_not_in_api": 0, "dates": [], "fcs": []}
             by_asin[asin]["ids"].append(shipment_id)
             by_asin[asin]["statuses"].add(status)
             by_asin[asin]["units"] += units
+            if status.lower() in NOT_IN_API:
+                by_asin[asin]["units_not_in_api"] += units
             if pickup_date:
                 by_asin[asin]["dates"].append(pickup_date)
             if dest_fc:
@@ -1115,11 +1120,12 @@ def _read_hedda_shipments(gc: gspread.Client) -> dict:
             ids_str    = ", ".join(d["ids"])
             fcs_str    = ", ".join(sorted(set(d["fcs"])))
             shipments[asin] = {
-                "status":   status_str,
-                "ids":      ids_str,
-                "units":    d["units"],
-                "fcs":      fcs_str,
-                "n":        len(d["ids"]),
+                "status":         status_str,
+                "ids":            ids_str,
+                "units":          d["units"],
+                "units_not_in_api": d["units_not_in_api"],
+                "fcs":            fcs_str,
+                "n":              len(d["ids"]),
             }
 
         print(f"  Hedda's sheet: {len(rows)-1} rows → {len(shipments)} ASINs with active shipments")
@@ -1878,34 +1884,35 @@ def run():
     # visible in SP-API (e.g. freight booked outside Amazon's system).
     hedda_covered = []
     for asin, s in shipments.items():
-        hedda_units = s.get("units", 0)
+        # Only use units that are NOT yet visible in SP-API (In Transit + Pending Pickup).
+        # "Receiving" units are already counted in SP-API inboundReceivingQuantity.
+        hedda_units = s.get("units_not_in_api", 0)
         if hedda_units <= 0:
             continue
         mask = forecast_df["asin"] == asin
         if not mask.any():
             continue
         r = forecast_df[mask].iloc[0]
-        # Skip if SP-API already shows inbound (already factored in) or product is on hold
-        if r["inbound"] > 0 or r["status"] == "Hold":
+        if r["status"] == "Hold":
             continue
-        # SP-API shows 0 inbound but Hedda has active units — supplement the calculation
-        combined  = int(r["available"]) + hedda_units + int(r["reserved"])
-        rp        = int(r["reorder_point"])
+        # Add Hedda's in-transit units on top of whatever SP-API already shows
+        combined = int(r["available"]) + int(r["inbound"]) + hedda_units + int(r["reserved"])
+        rp       = int(r["reorder_point"])
         if combined >= rp:
-            # Hedda's inbound fully covers the gap → no reorder needed
+            # Fully covered — no reorder needed
             forecast_df.loc[mask, "order_qty"] = 0
             forecast_df.loc[mask, "status"]    = "Covered by Inbound"
             hedda_covered.append(
                 f"{asin} ({ASIN_NAMES.get(asin, asin)}) — {hedda_units:,} Hedda units fully cover gap"
             )
-        elif int(r["available"]) < rp:
-            # Hedda's inbound partially covers — reduce order_qty by Hedda units
+        elif int(r["available"]) + int(r["inbound"]) + int(r["reserved"]) < rp:
+            # Partially covered — reduce order_qty by the extra Hedda units
             new_qty = max(0, rp - combined)
             if new_qty < int(r["order_qty"]):
                 forecast_df.loc[mask, "order_qty"] = new_qty
                 hedda_covered.append(
                     f"{asin} ({ASIN_NAMES.get(asin, asin)}) — order qty reduced to {new_qty:,} "
-                    f"after {hedda_units:,} Hedda units"
+                    f"after {hedda_units:,} Hedda in-transit units"
                 )
     if hedda_covered:
         print(f"      Hedda inbound supplement: {len(hedda_covered)} ASIN(s) updated")
