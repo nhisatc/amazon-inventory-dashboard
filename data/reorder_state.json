@@ -1,5 +1,5 @@
 {
-  "date": "2026-09-27",
+  "date": "2026-09-28",
   "reorder": {
     "B0981HX5NG": {
       "name": "Mineral Oil 8oz",
@@ -7,7 +7,7 @@
     },
     "B09CV925V4": {
       "name": "Castor Oil 10oz",
-      "order_qty": 617
+      "order_qty": 641
     },
     "B0CCMHLX72": {
       "name": "Castor Oil 20oz",
@@ -15,9 +15,6 @@
     }
   },
   "monitor": {
-    "B08Y7X8375": {
-      "name": "Hydrogen Peroxide 3% 32oz"
-    },
     "B097HP7DQ6": {
       "name": "Castor Oil 1 Gal"
     },
