@@ -1,5 +1,5 @@
 {
-  "date": "2026-10-12",
+  "date": "2026-10-13",
   "reorder": {
     "B0981HX5NG": {
       "name": "Mineral Oil 8oz",
@@ -7,7 +7,7 @@
     },
     "B09CV925V4": {
       "name": "Castor Oil 10oz",
-      "order_qty": 905
+      "order_qty": 921
     },
     "B0CCMHLX72": {
       "name": "Castor Oil 20oz",
@@ -15,9 +15,6 @@
     }
   },
   "monitor": {
-    "B097HP7DQ6": {
-      "name": "Castor Oil 1 Gal"
-    },
     "B09DZ2P2WJ": {
       "name": "Sweet Almond Oil 1 Gal"
     },
