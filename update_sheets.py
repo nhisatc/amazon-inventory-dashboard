@@ -156,7 +156,9 @@ def fetch_inventory() -> pd.DataFrame:
                 "inbound":      (d.get("inboundWorkingQuantity", 0) or 0)
                               + (d.get("inboundShippedQuantity", 0) or 0)
                               + (d.get("inboundReceivingQuantity", 0) or 0),
-                "reserved":     rv.get("totalReservedQuantity", 0) or 0,
+                "fc_transfer":  rv.get("pendingTransshipmentQuantity", 0) or 0,
+                "reserved":     max(0, (rv.get("totalReservedQuantity", 0) or 0)
+                                      - (rv.get("pendingTransshipmentQuantity", 0) or 0)),
                 "unfulfillable": unf.get("totalUnfulfillableQuantity", 0) or 0,
                 "expired":      unf.get("expiredQuantity", 0) or 0,
             })
@@ -211,6 +213,7 @@ def _consolidate_by_asin(df: pd.DataFrame) -> pd.DataFrame:
             "available":     int(group["available"].sum()),
             "inbound":       int(group["inbound"].sum()),
             "reserved":      int(group["reserved"].sum()),
+            "fc_transfer":   int(group["fc_transfer"].sum()),
             "unfulfillable": int(group["unfulfillable"].sum()),
             "expired":       int(group["expired"].sum()),
             "fbm":           0,  # filled in after fetch_fbm_inventory()
@@ -353,11 +356,11 @@ def run_forecast(inventory: pd.DataFrame, sales: pd.DataFrame, months: list[str]
     lt_mo              = LEAD_DAYS / 30
     df["safety_stock"] = (Z_SCORE * df["std_dev"] * math.sqrt(lt_mo)).round().astype(int)
     df["reorder_point"]= (df["safety_stock"] + df["forecast"] * lt_mo).round().astype(int)
-    # Order qty: only trigger if (available + inbound + reserved) < reorder_point,
+    # Order qty: only trigger if (available + inbound + reserved + fc_transfer) < reorder_point,
     # then order enough to cover TARGET_MONTHS demand netting out all pipeline stock.
     df["order_qty"] = df.apply(
-        lambda r: max(0, round(r["forecast"] * TARGET_MONTHS - r["available"] - r["inbound"] - r["reserved"]))
-        if (r["available"] + r["inbound"] + r["reserved"]) < r["reorder_point"] else 0, axis=1)
+        lambda r: max(0, round(r["forecast"] * TARGET_MONTHS - r["available"] - r["inbound"] - r["reserved"] - r["fc_transfer"]))
+        if (r["available"] + r["inbound"] + r["reserved"] + r["fc_transfer"]) < r["reorder_point"] else 0, axis=1)
     df["days_of_stock"]= df.apply(
         lambda r: round(r["available"] / (r["forecast"] / 30), 1)
         if r["forecast"] > 0 else (None if r["available"] == 0 else 9999), axis=1)
@@ -497,7 +500,7 @@ def write_forecast_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: list[s
     # Row 2: headers
     HEADERS = (
         ["Product (Name + ASIN)", "ASIN", "SKU", "Lead Time (Days)",
-         "Available Stock (FBA)", "Inbound Stock (FBA)", "Reserved Stock (FBA)", "Warehouse Stock (FBM)",
+         "Available Stock (FBA)", "Inbound Stock (FBA)", "Reserved Stock (FBA)", "FC Transfer (FBA)", "Warehouse Stock (FBM)",
          "Unfulfillable (FBA)", "Expired (FBA)"]
         + month_labels
         + ["Avg Monthly Demand (6-mo)", "3-Mo Moving Avg", "Trend (%)",
@@ -512,7 +515,7 @@ def write_forecast_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: list[s
         dos = row["days_of_stock"]
         r = (
             [_product_label(row["asin"], row.get("item_name", "")), row["asin"], row["sku"], LEAD_DAYS,
-             int(row["available"]), int(row["inbound"]), int(row["reserved"]), int(row.get("fbm", 0)),
+             int(row["available"]), int(row["inbound"]), int(row["reserved"]), int(row.get("fc_transfer", 0)), int(row.get("fbm", 0)),
              int(row.get("unfulfillable", 0)), int(row.get("expired", 0))]
             + [int(row.get(m, 0)) for m in months]
             + [_clean(round(row["avg_6mo"], 1)), _clean(round(row["avg_3mo"], 1)),
@@ -531,8 +534,8 @@ def write_forecast_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: list[s
     spark_col_letter = _col_letter(len(HEADERS))   # column right after last header
     ws.update([["Trend"]], f"{spark_col_letter}2")
     spark_formulas = []
-    month_start_col = _col_letter(10)              # column K = first month (after 10 fixed cols)
-    month_end_col   = _col_letter(9 + len(months)) # last month column
+    month_start_col = _col_letter(11)              # column L = first month (after 11 fixed cols)
+    month_end_col   = _col_letter(10 + len(months)) # last month column
     for ri in range(3, 3 + len(rows)):
         spark_formulas.append([
             f'=SPARKLINE({month_start_col}{ri}:{month_end_col}{ri},'
@@ -563,7 +566,7 @@ def write_forecast_tab(ss: gspread.Spreadsheet, df: pd.DataFrame, months: list[s
 
     # Column widths
     col_widths = (
-        [280, 110, 160, 80, 100, 100, 100, 110, 110, 80]  # Name, ASIN, SKU, lead, avail(FBA), inbound(FBA), reserved(FBA), FBM, unfulfillable, expired
+        [280, 110, 160, 80, 100, 100, 100, 90, 110, 110, 80]  # Name, ASIN, SKU, lead, avail(FBA), inbound(FBA), reserved(FBA), fc_transfer(FBA), FBM, unfulfillable, expired
         + [70] * len(months)               # month columns
         + [90, 90, 70, 90, 70, 80, 90, 80, 130, 80]  # calc columns
     )
@@ -1896,7 +1899,7 @@ def run():
         if r["status"] == "Hold":
             continue
         # Add Hedda's in-transit units on top of whatever SP-API already shows
-        combined = int(r["available"]) + int(r["inbound"]) + hedda_units + int(r["reserved"])
+        combined = int(r["available"]) + int(r["inbound"]) + hedda_units + int(r["reserved"]) + int(r.get("fc_transfer", 0))
         rp       = int(r["reorder_point"])
         if combined >= rp:
             # Fully covered — no reorder needed
@@ -1905,7 +1908,7 @@ def run():
             hedda_covered.append(
                 f"{asin} ({ASIN_NAMES.get(asin, asin)}) — {hedda_units:,} Hedda units fully cover gap"
             )
-        elif int(r["available"]) + int(r["inbound"]) + int(r["reserved"]) < rp:
+        elif int(r["available"]) + int(r["inbound"]) + int(r["reserved"]) + int(r.get("fc_transfer", 0)) < rp:
             # Partially covered — reduce order_qty by the extra Hedda units
             new_qty = max(0, rp - combined)
             if new_qty < int(r["order_qty"]):
