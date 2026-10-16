@@ -136,36 +136,126 @@ def _marketplace():
     return Marketplaces.US
 
 
+def _fetch_fba_report() -> pd.DataFrame:
+    """Download FBA Manage Inventory Health Report — same source as Seller Central.
+    Returns accurate available / inbound / reserved / unfulfillable per SKU."""
+    import urllib.request, io
+
+    reports = Reports(credentials=SP_CREDS, marketplace=_marketplace(), verify=SSL_VERIFY)
+
+    resp = reports.create_report(
+        reportType="GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA",
+        marketplaceIds=[MARKETPLACE_ID],
+    )
+    report_id = resp.payload["reportId"]
+    print(f"      FBA report requested ({report_id}), waiting...", flush=True)
+
+    for _ in range(72):   # poll up to 6 min (5-sec intervals)
+        time.sleep(5)
+        status = reports.get_report(reportId=report_id).payload
+        proc = status.get("processingStatus", "")
+        if proc == "DONE":
+            break
+        if proc in ("CANCELLED", "FATAL"):
+            raise RuntimeError(f"FBA inventory report failed: {proc}")
+    else:
+        raise TimeoutError("FBA inventory report timed out after 6 minutes")
+
+    doc = reports.get_report_document(reportDocumentId=status["reportDocumentId"]).payload
+    with urllib.request.urlopen(doc["url"]) as r:
+        raw = r.read()
+    if doc.get("compressionAlgorithm") == "GZIP":
+        raw = gzip.decompress(raw)
+
+    df = pd.read_csv(io.StringIO(raw.decode("utf-8")), sep="\t")
+    df = df.rename(columns={
+        "product-name":                  "item_name",
+        "afn-fulfillable-quantity":      "available",
+        "afn-inbound-working-quantity":  "inbound_working",
+        "afn-inbound-shipped-quantity":  "afn_shipped",
+        "afn-inbound-receiving-quantity":"afn_receiving",
+        "afn-reserved-quantity":         "reserved",
+        "afn-unsellable-quantity":       "unfulfillable",
+    })
+    df["inbound"] = (
+        pd.to_numeric(df.get("inbound_working", 0), errors="coerce").fillna(0) +
+        pd.to_numeric(df.get("afn_shipped",      0), errors="coerce").fillna(0) +
+        pd.to_numeric(df.get("afn_receiving",    0), errors="coerce").fillna(0)
+    ).astype(int)
+    for col in ("available", "reserved", "unfulfillable"):
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    df = df[df["asin"].notna() & (df["asin"].astype(str).str.strip() != "")]
+    print(f"      FBA report downloaded — {len(df)} SKUs", flush=True)
+    return df[["sku", "asin", "item_name", "available", "inbound", "reserved", "unfulfillable"]]
+
+
 def fetch_inventory() -> pd.DataFrame:
+    # Pull fc_transfer + expired from getInventorySummaries (fast, these fields are reliable)
     api = Inventories(credentials=SP_CREDS, marketplace=_marketplace(), verify=SSL_VERIFY)
-    rows, next_token = [], None
+    api_rows, next_token = [], None
     while True:
         kw = dict(details=True)
         if next_token:
             kw["nextToken"] = next_token
         resp = api.get_inventory_summary_marketplace(**kw).payload
         for item in resp.get("inventorySummaries", []):
-            d    = item.get("inventoryDetails", {})
-            rv   = d.get("reservedQuantity", {})
-            unf  = d.get("unfulfillableQuantity", {})
-            rows.append({
-                "sku":          item.get("sellerSku", ""),
-                "asin":         item.get("asin", ""),
-                "item_name":    item.get("productName", ""),
-                "available":    d.get("fulfillableQuantity", 0) or 0,
-                "inbound":      (d.get("inboundWorkingQuantity", 0) or 0)
-                              + (d.get("inboundShippedQuantity", 0) or 0)
-                              + (d.get("inboundReceivingQuantity", 0) or 0),
-                "fc_transfer":  rv.get("pendingTransshipmentQuantity", 0) or 0,
-                "reserved":     max(0, (rv.get("totalReservedQuantity", 0) or 0)
-                                      - (rv.get("pendingTransshipmentQuantity", 0) or 0)),
-                "unfulfillable": unf.get("totalUnfulfillableQuantity", 0) or 0,
-                "expired":      unf.get("expiredQuantity", 0) or 0,
+            d  = item.get("inventoryDetails", {})
+            rv = d.get("reservedQuantity", {})
+            unf = d.get("unfulfillableQuantity", {})
+            api_rows.append({
+                "sku":         item.get("sellerSku", ""),
+                "asin":        item.get("asin", ""),
+                "item_name":   item.get("productName", ""),
+                "fc_transfer": rv.get("pendingTransshipmentQuantity", 0) or 0,
+                "expired":     unf.get("expiredQuantity", 0) or 0,
             })
         next_token = resp.get("pagination", {}).get("nextToken")
         if not next_token:
             break
-    return pd.DataFrame(rows)
+    api_df = pd.DataFrame(api_rows)
+
+    # Pull accurate available / inbound / reserved from FBA inventory report
+    try:
+        report_df = _fetch_fba_report()
+        merged = report_df.merge(
+            api_df[["sku", "fc_transfer", "expired"]], on="sku", how="left"
+        )
+        merged["fc_transfer"] = merged["fc_transfer"].fillna(0).astype(int)
+        merged["expired"]     = merged["expired"].fillna(0).astype(int)
+        return merged
+    except Exception as e:
+        print(f"      WARNING: FBA report failed ({e}), falling back to getInventorySummaries", flush=True)
+        api_df["available"]    = api_df.pop("item_name").apply(lambda _: 0)  # will be rebuilt
+        # reconstruct from api_df which already has all fields in fallback path
+        rows2, next_token = [], None
+        api2 = Inventories(credentials=SP_CREDS, marketplace=_marketplace(), verify=SSL_VERIFY)
+        while True:
+            kw = dict(details=True)
+            if next_token:
+                kw["nextToken"] = next_token
+            resp = api2.get_inventory_summary_marketplace(**kw).payload
+            for item in resp.get("inventorySummaries", []):
+                d = item.get("inventoryDetails", {})
+                rv = d.get("reservedQuantity", {})
+                unf = d.get("unfulfillableQuantity", {})
+                rows2.append({
+                    "sku":          item.get("sellerSku", ""),
+                    "asin":         item.get("asin", ""),
+                    "item_name":    item.get("productName", ""),
+                    "available":    d.get("fulfillableQuantity", 0) or 0,
+                    "inbound":      (d.get("inboundWorkingQuantity", 0) or 0)
+                                  + (d.get("inboundShippedQuantity", 0) or 0)
+                                  + (d.get("inboundReceivingQuantity", 0) or 0),
+                    "fc_transfer":  rv.get("pendingTransshipmentQuantity", 0) or 0,
+                    "reserved":     max(0, (rv.get("totalReservedQuantity", 0) or 0)
+                                          - (rv.get("pendingTransshipmentQuantity", 0) or 0)),
+                    "unfulfillable": unf.get("totalUnfulfillableQuantity", 0) or 0,
+                    "expired":      unf.get("expiredQuantity", 0) or 0,
+                })
+            next_token = resp.get("pagination", {}).get("nextToken")
+            if not next_token:
+                break
+        return pd.DataFrame(rows2)
 
 
 def fetch_fbm_inventory() -> dict:
