@@ -1,13 +1,13 @@
 {
-  "date": "2026-10-26",
+  "date": "2026-10-27",
   "reorder": {
     "B08Y7X8375": {
       "name": "Hydrogen Peroxide 3% 32oz",
-      "order_qty": 320
+      "order_qty": 444
     },
     "B097LTHS4S": {
       "name": "Vegetable Glycerin 32oz",
-      "order_qty": 1062
+      "order_qty": 695
     },
     "B0981HX5NG": {
       "name": "Mineral Oil 8oz",
@@ -15,11 +15,11 @@
     },
     "B09CV925V4": {
       "name": "Castor Oil 10oz",
-      "order_qty": 1060
+      "order_qty": 1066
     },
     "B0BR99MF15": {
       "name": "Vegetable Glycerin 1 Gal",
-      "order_qty": 21
+      "order_qty": 580
     },
     "B0CCMHLX72": {
       "name": "Castor Oil 20oz",
