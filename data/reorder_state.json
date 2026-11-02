@@ -1,13 +1,13 @@
 {
-  "date": "2026-11-01",
+  "date": "2026-11-02",
   "reorder": {
     "B08Y7X8375": {
       "name": "Hydrogen Peroxide 3% 32oz",
-      "order_qty": 842
+      "order_qty": 882
     },
     "B097LTHS4S": {
       "name": "Vegetable Glycerin 32oz",
-      "order_qty": 5836
+      "order_qty": 6047
     },
     "B0981HX5NG": {
       "name": "Mineral Oil 8oz",
@@ -15,16 +15,19 @@
     },
     "B09CV925V4": {
       "name": "Castor Oil 10oz",
-      "order_qty": 571
+      "order_qty": 577
     },
     "B0BR99MF15": {
       "name": "Vegetable Glycerin 1 Gal",
-      "order_qty": 4634
+      "order_qty": 4811
     }
   },
   "monitor": {
     "B097HP7DQ6": {
       "name": "Castor Oil 1 Gal"
+    },
+    "B0981HG4PR": {
+      "name": "US+ 100% Pure Mineral Oil - Cutting Board Oil - Food-Grade - USP - Kosher - GMO-free - Restores & Protects Cutting Boards, Butcher Blocks, Countertops, Steel Surfaces & More (4 Fl Oz)"
     },
     "B09DZ2P2WJ": {
       "name": "Sweet Almond Oil 1 Gal"
