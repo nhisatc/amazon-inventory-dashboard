@@ -1,0 +1,70 @@
+name: Verify Amazon SP-API Credentials
+
+# Manual-only check. Does not retrieve reports, change data, or send alerts.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify LWA authentication
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Amazon Login with Amazon credentials
+        shell: bash
+        env:
+          LWA_APP_ID: ${{ secrets.LWA_APP_ID }}
+          LWA_CLIENT_SECRET: ${{ secrets.LWA_CLIENT_SECRET }}
+          SP_API_REFRESH_TOKEN: ${{ secrets.SP_API_REFRESH_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlencode
+          from urllib.request import Request, urlopen
+
+          keys = ("LWA_APP_ID", "LWA_CLIENT_SECRET", "SP_API_REFRESH_TOKEN")
+          missing = [key for key in keys if not os.environ.get(key)]
+          if missing:
+              print("::error::Missing GitHub Actions secrets: " + ", ".join(missing))
+              sys.exit(1)
+
+          payload = urlencode({
+              "grant_type": "refresh_token",
+              "client_id": os.environ["LWA_APP_ID"],
+              "client_secret": os.environ["LWA_CLIENT_SECRET"],
+              "refresh_token": os.environ["SP_API_REFRESH_TOKEN"],
+          }).encode()
+          request = Request(
+              "https://api.amazon.com/auth/o2/token",
+              data=payload,
+              headers={"Content-Type": "application/x-www-form-urlencoded"},
+              method="POST",
+          )
+
+          try:
+              with urlopen(request, timeout=25) as response:
+                  result = json.load(response)
+          except HTTPError as error:
+              print(f"::error::Amazon LWA authorization rejected (HTTP {error.code}). "
+                    "Verify the app ID and refresh token; rotate the LWA client "
+                    "secret in Amazon Developer Central and update "
+                    "LWA_CLIENT_SECRET in this repository's Actions secrets. "
+                    "No credentials were printed.")
+              sys.exit(1)
+          except (URLError, TimeoutError, ValueError) as error:
+              print("::error::Could not complete Amazon LWA credential check. "
+                    "Check GitHub network availability or try again.")
+              sys.exit(1)
+
+          if not isinstance(result, dict) or not result.get("access_token"):
+              print("::error::Amazon did not return an access token.")
+              sys.exit(1)
+
+          print("Amazon LWA authentication succeeded. "
+                "Credentials accepted; no token values printed.")
+          PY
