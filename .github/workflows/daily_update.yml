@@ -45,5 +45,26 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/sales_history.json data/reorder_state.json
-          git diff --staged --quiet || git commit -m "chore: update sales history + reorder state [skip ci]"
-          git push
+          if git diff --staged --quiet; then
+            echo "No state changes to commit"
+            exit 0
+          fi
+          git commit -m "chore: update sales history + reorder state [skip ci]"
+          # A second workflow or repository edit can advance master while this
+          # job is fetching inventory. Rebase our state commit before pushing.
+          for attempt in 1 2 3; do
+            git fetch origin master
+            if ! git rebase origin/master; then
+              git rebase --abort || true
+              echo "State commit conflicts with updated master; review required" >&2
+              exit 1
+            fi
+            if git push origin HEAD:master; then
+              echo "Updated state committed successfully"
+              exit 0
+            fi
+            echo "Push race on attempt $attempt; retrying"
+            sleep 5
+          done
+          echo "Unable to push state after 3 attempts" >&2
+          exit 1
